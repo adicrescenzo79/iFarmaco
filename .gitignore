@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+data/bugiardini/
+data/chat_sessions/
+data/chroma/
+data/ifarmaco.sqlite3
+data/ifarmaco.sqlite3-shm
+data/ifarmaco.sqlite3-wal

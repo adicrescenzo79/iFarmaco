@@ -1,0 +1,241 @@
+<!doctype html>
+<html lang="it">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#f5f7f4">
+    <title>iFarmaco — Assistente ai bugiardini</title>
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar" aria-label="Navigazione principale">
+        <a class="brand" href="#" aria-label="iFarmaco, home">
+          <span class="brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 32 32" fill="none">
+              <path d="M12.5 5.5a5 5 0 0 1 7 0l7 7a5 5 0 0 1-7 7l-7-7a5 5 0 0 1 0-7Z" stroke="currentColor" stroke-width="2.2"/>
+              <path d="m15 17 7-7M5.5 19.5a5 5 0 0 1 7 0l1 1a5 5 0 0 1-7 7l-1-1a5 5 0 0 1 0-7Z" stroke="currentColor" stroke-width="2.2"/>
+              <path d="m9 23 5-5" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/>
+            </svg>
+          </span>
+          <span>iFarmaco<span class="brand-period">.</span></span>
+        </a>
+
+        <div class="sidebar-caption">IL TUO SPAZIO</div>
+        <nav class="main-nav">
+          <a class="nav-item active" href="#" data-view="chat" aria-current="page">
+            <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M8 10h8M8 14h5m-8 7 2.4-3H18a3 3 0 0 0 3-3V6a3 3 0 0 0-3-3H6a3 3 0 0 0-3 3v15Z" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            <span>Nuova domanda</span>
+          </a>
+          <a class="nav-item" href="#" data-view="medicines">
+            <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H20v17H6.5A2.5 2.5 0 0 1 4 17.5v-12ZM4 17.5A2.5 2.5 0 0 1 6.5 15H20M8 7h8m-8 4h6" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            <span>Farmaci</span>
+          </a>
+          <a class="nav-item" href="#" data-view="stock">
+            <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M4 7.5 12 3l8 4.5v9L12 21l-8-4.5v-9Z" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/><path d="m4.5 7.8 7.5 4.3 7.5-4.3M12 12v8.5M8 5.2l8 4.6" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></svg>
+            <span>Scorte</span>
+          </a>
+        </nav>
+
+        <div class="sidebar-bottom">
+          <div class="privacy-card">
+            <span class="privacy-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none"><path d="M12 3 4.5 6v5.5c0 4.7 3.2 7.8 7.5 9.5 4.3-1.7 7.5-4.8 7.5-9.5V6L12 3Z" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/><path d="m9 12 2 2 4-4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </span>
+            <strong>Informazioni affidabili</strong>
+            <p>Risposte basate sui foglietti illustrativi ufficiali.</p>
+          </div>
+          <div class="sidebar-footer">
+            <span class="status-dot"></span>
+            <span>Database SQLite</span>
+            <span class="version">locale</span>
+          </div>
+        </div>
+      </aside>
+
+      <main class="main-content">
+        <header class="topbar">
+          <div class="breadcrumbs"><span>iFarmaco</span><span class="crumb-separator">/</span><strong id="breadcrumb-current">Nuova domanda</strong></div>
+          <div class="topbar-right">
+            <span class="preview-pill"><span></span> SQLITE LOCALE</span>
+            <button class="profile-button" type="button" aria-label="Profilo utente">L</button>
+          </div>
+        </header>
+
+        <section class="workspace">
+          <div id="chat-view">
+          <div class="page-heading">
+            <div class="eyebrow"><span class="eyebrow-line"></span> IL TUO ASSISTENTE AI FARMACI</div>
+            <h1>Facciamo chiarezza,<br><em>insieme.</em></h1>
+            <p class="heading-copy">Fai una domanda sul tuo farmaco. Troverai risposte semplici, con i riferimenti al foglietto illustrativo.</p>
+          </div>
+
+          <section class="chat-controls" aria-label="Impostazioni della chat">
+            <label class="chat-control">
+              <span>Filtro farmaco, facoltativo</span>
+              <select id="chat-medicine">
+                <option value="">Tutti quelli nominati nella domanda</option>
+              </select>
+            </label>
+            <label class="chat-control">
+              <span>Modello</span>
+              <select id="chat-model"></select>
+            </label>
+            <label class="chat-control compact-control">
+              <span>Fonti</span>
+              <input id="chat-top-k" type="number" min="1" max="8" value="4">
+            </label>
+            <label class="chat-control">
+              <span>Memoria</span>
+              <select id="chat-memory">
+                <option value="buffer">Buffer</option>
+                <option value="summary">Riassunto</option>
+              </select>
+            </label>
+            <label class="chat-control compact-control">
+              <span>Budget token</span>
+              <input id="chat-budget" type="number" min="150" max="4000" step="50" value="700">
+            </label>
+            <button class="new-chat-button" id="new-chat" type="button" title="Avvia una nuova conversazione">
+              <span aria-hidden="true">＋</span>
+              <span>Nuova chat</span>
+            </button>
+          </section>
+          <div class="chat-setup-notice" id="chat-setup-notice" role="status" hidden></div>
+
+          <section class="chat-card" aria-label="Conversazione">
+            <div class="chat-header">
+              <div class="chat-title">
+                <span class="assistant-avatar" aria-hidden="true">
+                  <svg viewBox="0 0 24 24" fill="none"><path d="M12 3v2m0 14v2M3 12h2m14 0h2M5.64 5.64l1.42 1.42m9.88 9.88 1.42 1.42m0-12.72-1.42 1.42m-9.88 9.88-1.42 1.42" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/><circle cx="12" cy="12" r="4" stroke="currentColor" stroke-width="1.7"/></svg>
+                </span>
+                <div>
+                  <strong>Assistente iFarmaco</strong>
+                  <span><span class="online-dot" id="chat-status-dot"></span><span id="chat-status">Connessione in corso</span></span>
+                </div>
+              </div>
+              <span class="session-label">SESSIONE LOCALE</span>
+            </div>
+
+            <div class="conversation" id="conversation" aria-live="polite" aria-relevant="additions text">
+              <div class="answer-row">
+                <span class="answer-avatar" aria-hidden="true">
+                  <svg viewBox="0 0 24 24" fill="none"><path d="M12 3v2m0 14v2M3 12h2m14 0h2M5.64 5.64l1.42 1.42m9.88 9.88 1.42 1.42m0-12.72-1.42 1.42m-9.88 9.88-1.42 1.42" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/><circle cx="12" cy="12" r="4" stroke="currentColor" stroke-width="1.7"/></svg>
+                </span>
+                <div class="answer-content">
+                  <span class="message-label">ASSISTENTE IFARMACO</span>
+                  <p>Chiedimi informazioni su uno o più farmaci: puoi citarli nella domanda.</p>
+                </div>
+              </div>
+            </div>
+
+            <form class="composer" id="chat-form" aria-label="Scrivi una domanda">
+              <label class="sr-only" for="question">Scrivi la tua domanda</label>
+              <textarea id="question" rows="1" placeholder="Scrivi la tua domanda sul farmaco selezionato..." maxlength="4000"></textarea>
+              <div class="composer-footer">
+                <span class="composer-hint"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.6"/><path d="M12 11v5m0-8h.01" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg> Le risposte non sostituiscono il parere del medico.</span>
+                <button class="send-button" id="send-question" type="submit" aria-label="Invia domanda" disabled>
+                  <span>Invia domanda</span>
+                  <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                </button>
+              </div>
+            </form>
+          </section>
+
+          <div class="below-chat">
+            <span class="suggestion-label">NON SAI DA DOVE INIZIARE?</span>
+            <div class="suggestions">
+              <button type="button">Quali sono gli effetti indesiderati?</button>
+              <button type="button">Come devo conservare il farmaco?</button>
+              <button type="button">Quando non devo assumerlo?</button>
+            </div>
+          </div>
+          </div>
+
+          <section class="database-view" id="database-view" hidden>
+            <div class="page-heading database-heading">
+              <div class="eyebrow"><span class="eyebrow-line"></span> ARCHIVIO LOCALE</div>
+              <h1 id="database-title">Farmaci</h1>
+              <p class="heading-copy" id="database-description">Consulta e aggiorna il catalogo dei farmaci salvato nel database SQLite.</p>
+            </div>
+
+            <div class="summary-grid" aria-label="Riepilogo archivio">
+              <article class="summary-card">
+                <span class="summary-icon medicine-summary-icon" aria-hidden="true">Rx</span>
+                <span class="summary-label">FARMACI</span>
+                <strong id="summary-medicines">—</strong>
+                <small>nel catalogo</small>
+              </article>
+              <article class="summary-card">
+                <span class="summary-icon stock-summary-icon" aria-hidden="true">▧</span>
+                <span class="summary-label">LOTTI DI SCORTA</span>
+                <strong id="summary-lots">—</strong>
+                <small>registrati</small>
+              </article>
+              <article class="summary-card">
+                <span class="summary-icon pieces-summary-icon" aria-hidden="true">＋</span>
+                <span class="summary-label">PEZZI DISPONIBILI</span>
+                <strong id="summary-pieces">—</strong>
+                <small>totale scorte</small>
+              </article>
+            </div>
+
+            <section class="records-card" aria-label="Tabella dati">
+              <div class="records-toolbar">
+                <div>
+                  <h2 id="records-title">Elenco farmaci</h2>
+                  <p id="records-description">Dati importati dal catalogo AIFA e modificabili localmente.</p>
+                </div>
+                <button class="primary-button" id="add-record" type="button">
+                  <span aria-hidden="true">＋</span>
+                  <span id="add-record-label">Aggiungi farmaco</span>
+                </button>
+              </div>
+              <div class="records-controls">
+                <label class="search-box">
+                  <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><circle cx="10.8" cy="10.8" r="6.8" stroke="currentColor" stroke-width="1.7"/><path d="m16 16 4.5 4.5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+                  <input id="record-search" type="search" placeholder="Cerca per nome o codice..." autocomplete="off">
+                </label>
+                <span class="record-count" id="record-count"></span>
+              </div>
+              <div class="table-scroll">
+                <table class="records-table">
+                  <thead id="records-head"></thead>
+                  <tbody id="records-body"></tbody>
+                </table>
+              </div>
+              <div class="empty-state" id="empty-state" hidden>
+                <span aria-hidden="true">⌕</span>
+                <strong>Nessun risultato</strong>
+                <p>Prova a modificare la ricerca o aggiungi un nuovo record.</p>
+              </div>
+            </section>
+          </section>
+
+          <footer class="page-footer">
+            <span>iFarmaco <span class="footer-dot">·</span> Informazione chiara, scelta consapevole.</span>
+            <span>Consulta sempre il medico o il farmacista per consigli personali.</span>
+          </footer>
+        </section>
+      </main>
+    </div>
+    <dialog class="record-dialog" id="record-dialog">
+      <form id="record-form" method="dialog">
+        <div class="dialog-heading">
+          <div>
+            <span class="dialog-eyebrow">DATABASE SQLITE</span>
+            <h2 id="dialog-title">Nuovo record</h2>
+          </div>
+          <button class="dialog-close" type="button" id="close-dialog" aria-label="Chiudi">×</button>
+        </div>
+        <div class="dialog-fields" id="dialog-fields"></div>
+        <div class="dialog-actions">
+          <button class="secondary-button" type="button" id="cancel-dialog">Annulla</button>
+          <button class="primary-button" type="submit" id="save-record">Salva</button>
+        </div>
+      </form>
+    </dialog>
+    <div class="toast-message" id="toast-message" role="status" aria-live="polite"></div>
+    <script src="app.js" defer></script>
+  </body>
+</html>
