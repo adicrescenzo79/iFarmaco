@@ -1,3 +1,15 @@
+const defaultChatSettings = {
+  model: "gpt-4o-mini",
+  embedding_model: "text-embedding-3-small",
+  top_k: 4,
+  memory_mode: "buffer",
+  budget_tokens: 700,
+  show_reasoning: false,
+  show_interaction_cost: false,
+};
+const defaultChatModels = ["gpt-4o-mini", "gpt-4.1-mini"];
+const defaultEmbeddingModels = ["text-embedding-3-small", "text-embedding-3-large"];
+
 const state = {
   view: "chat",
   records: [],
@@ -9,6 +21,8 @@ const state = {
   chatHistory: [],
   chatBusy: false,
   chatConfigured: false,
+  chatSettings: { ...defaultChatSettings },
+  settingsDirty: false,
 };
 
 const viewConfig = {
@@ -51,6 +65,7 @@ const stockFields = [
 const elements = {
   nav: [...document.querySelectorAll("[data-view]")],
   chatView: document.querySelector("#chat-view"),
+  settingsView: document.querySelector("#settings-view"),
   databaseView: document.querySelector("#database-view"),
   breadcrumb: document.querySelector("#breadcrumb-current"),
   databaseTitle: document.querySelector("#database-title"),
@@ -74,11 +89,16 @@ const elements = {
   chatForm: document.querySelector("#chat-form"),
   question: document.querySelector("#question"),
   conversation: document.querySelector("#conversation"),
-  chatMedicine: document.querySelector("#chat-medicine"),
+  answerAvatar: document.querySelector(".answer-avatar"),
   chatModel: document.querySelector("#chat-model"),
+  chatEmbeddingModel: document.querySelector("#chat-embedding-model"),
   chatTopK: document.querySelector("#chat-top-k"),
   chatMemory: document.querySelector("#chat-memory"),
   chatBudget: document.querySelector("#chat-budget"),
+  chatShowReasoning: document.querySelector("#chat-show-reasoning"),
+  chatShowInteractionCost: document.querySelector("#chat-show-interaction-cost"),
+  settingsForm: document.querySelector("#settings-form"),
+  saveSettings: document.querySelector("#save-settings"),
   chatStatus: document.querySelector("#chat-status"),
   chatStatusDot: document.querySelector("#chat-status-dot"),
   chatSetupNotice: document.querySelector("#chat-setup-notice"),
@@ -114,8 +134,10 @@ function showToast(message, isError = false) {
 function showView(view) {
   state.view = view;
   const isChat = view === "chat";
+  const isSettings = view === "settings";
   elements.chatView.hidden = !isChat;
-  elements.databaseView.hidden = isChat;
+  elements.settingsView.hidden = !isSettings;
+  elements.databaseView.hidden = isChat || isSettings;
   elements.nav.forEach((link) => {
     const active = link.dataset.view === view;
     link.classList.toggle("active", active);
@@ -128,6 +150,11 @@ function showView(view) {
 
   if (isChat) {
     elements.breadcrumb.textContent = "Nuova domanda";
+    return;
+  }
+
+  if (isSettings) {
+    elements.breadcrumb.textContent = "Impostazioni";
     return;
   }
 
@@ -391,12 +418,16 @@ async function saveRecord(event) {
   const url = state.editing ? `${base}/${encodeURIComponent(id)}` : base;
   const method = state.editing ? "PUT" : "POST";
   try {
-    await requestJSON(url, {
+    const result = await requestJSON(url, {
       method,
       body: isNewMedicine ? formData : JSON.stringify(payload),
     });
     elements.dialog.close();
-    showToast(state.editing ? "Modifiche salvate." : "Record aggiunto.");
+    if (isNewMedicine && result.embedding_status !== "indexed") {
+      showToast(result.embedding_message || "Farmaco salvato, ma non indicizzato.", true);
+    } else {
+      showToast(state.editing ? "Modifiche salvate." : "Record aggiunto.");
+    }
     await loadDatabaseView();
   } catch (error) {
     showToast(error.message, true);
@@ -442,7 +473,7 @@ function renderChat(messages = [], pending = false) {
 
     const row = document.createElement("div");
     row.className = "answer-row";
-    const avatar = document.querySelector(".answer-avatar").cloneNode(true);
+    const avatar = elements.answerAvatar.cloneNode(true);
     const content = document.createElement("div");
     content.className = "answer-content";
     const label = document.createElement("span");
@@ -463,6 +494,33 @@ function renderChat(messages = [], pending = false) {
       link.append(page);
       content.append(link);
     });
+    const showReasoning = state.chatSettings.show_reasoning && message.reasoning;
+    const showCost = state.chatSettings.show_interaction_cost
+      && Number.isFinite(message.interaction_cost_usd);
+    if (showReasoning || showCost) {
+      const details = document.createElement("div");
+      details.className = "answer-details";
+      if (showReasoning) {
+        const explanation = document.createElement("p");
+        explanation.className = "answer-reasoning";
+        const label = document.createElement("strong");
+        label.textContent = "Sintesi";
+        explanation.append(label, document.createTextNode(message.reasoning));
+        details.append(explanation);
+      }
+      if (showCost) {
+        const cost = document.createElement("p");
+        cost.className = "answer-cost";
+        cost.textContent = `Costo stimato: ${new Intl.NumberFormat("it-IT", {
+          style: "currency",
+          currency: "USD",
+          minimumFractionDigits: 6,
+          maximumFractionDigits: 8,
+        }).format(message.interaction_cost_usd)} · calcolo indicativo sui token API`;
+        details.append(cost);
+      }
+      content.append(details);
+    }
     row.append(avatar, content);
     elements.conversation.append(row);
   });
@@ -470,7 +528,7 @@ function renderChat(messages = [], pending = false) {
     const row = document.createElement("div");
     row.className = "answer-row is-pending";
     row.setAttribute("role", "status");
-    const avatar = document.querySelector(".answer-avatar").cloneNode(true);
+    const avatar = elements.answerAvatar.cloneNode(true);
     const content = document.createElement("div");
     content.className = "answer-content";
     const text = document.createElement("p");
@@ -485,23 +543,32 @@ function renderChat(messages = [], pending = false) {
 async function initializeChat() {
   localStorage.setItem("ifarmaco-chat-session", state.sessionId);
   try {
-    const [medicines, config] = await Promise.all([
-      requestJSON("/api/medicines"),
+    const [config, settings] = await Promise.all([
       requestJSON("/api/chat/config"),
+      requestJSON("/api/chat/settings"),
     ]);
-    medicines.forEach((medicine) => {
-      const option = document.createElement("option");
-      option.value = medicine.id;
-      option.textContent = `${medicine.nome} · ${medicine.id}`;
-      elements.chatMedicine.append(option);
-    });
-    config.models.forEach((model) => {
+    elements.chatModel.replaceChildren();
+    (config.models || defaultChatModels).forEach((model) => {
       const option = document.createElement("option");
       option.value = model;
       option.textContent = model;
       elements.chatModel.append(option);
     });
-    elements.chatModel.value = config.default_model;
+    elements.chatEmbeddingModel.replaceChildren();
+    (config.embedding_models || defaultEmbeddingModels).forEach((model) => {
+      const option = document.createElement("option");
+      option.value = model;
+      option.textContent = model;
+      elements.chatEmbeddingModel.append(option);
+    });
+    state.chatSettings = { ...defaultChatSettings, ...settings };
+    elements.chatModel.value = state.chatSettings.model;
+    elements.chatEmbeddingModel.value = state.chatSettings.embedding_model;
+    elements.chatTopK.value = state.chatSettings.top_k;
+    elements.chatMemory.value = state.chatSettings.memory_mode;
+    elements.chatBudget.value = state.chatSettings.budget_tokens;
+    elements.chatShowReasoning.checked = state.chatSettings.show_reasoning;
+    elements.chatShowInteractionCost.checked = state.chatSettings.show_interaction_cost;
     elements.chatStatus.textContent = config.configured ? "Pronto ad aiutarti" : "API non configurata";
     state.chatConfigured = config.configured;
     elements.chatStatusDot.classList.toggle("is-offline", !config.configured);
@@ -512,9 +579,6 @@ async function initializeChat() {
     }
     const saved = await requestJSON(`/api/chat/session/${encodeURIComponent(state.sessionId)}`);
     state.chatHistory = saved.messages;
-    if (saved.medicine_id) {
-      elements.chatMedicine.value = saved.medicine_id;
-    }
     renderChat(state.chatHistory);
   } catch (error) {
     elements.chatStatus.textContent = "Servizio non disponibile";
@@ -525,12 +589,21 @@ async function initializeChat() {
 
 async function sendChat(event) {
   event.preventDefault();
+  if (state.settingsDirty) {
+    showToast("Salva le impostazioni prima di inviare una domanda.", true);
+    return;
+  }
+  if (!state.chatConfigured) {
+    showToast("La chat non è configurata. Riavvia l'app dopo aver aggiornato .env.", true);
+    return;
+  }
   const message = elements.question.value.trim();
   if (!message || state.chatBusy) {
     return;
   }
   state.chatBusy = true;
   elements.sendQuestion.disabled = true;
+  elements.question.value = "";
   elements.chatStatus.textContent = "Sto cercando nel bugiardino";
   renderChat([...state.chatHistory, { role: "user", content: message }], true);
   try {
@@ -538,28 +611,53 @@ async function sendChat(event) {
       method: "POST",
       body: JSON.stringify({
         session_id: state.sessionId,
-        medicine_id: elements.chatMedicine.value || null,
         message,
-        model: elements.chatModel.value,
-        top_k: Number(elements.chatTopK.value),
-        memory_mode: elements.chatMemory.value,
-        budget_tokens: Number(elements.chatBudget.value),
+        ...state.chatSettings,
       }),
     });
     state.chatHistory = result.messages;
     renderChat(state.chatHistory);
-    elements.question.value = "";
     elements.chatStatus.textContent = result.searched_query !== message
       ? `Ricerca: ${result.searched_query}`
       : "Pronto ad aiutarti";
   } catch (error) {
     renderChat(state.chatHistory);
+    if (!elements.question.value.trim()) {
+      elements.question.value = message;
+    }
     showToast(error.message, true);
-    elements.chatStatus.textContent = "Pronto ad aiutarti";
+    elements.chatStatus.textContent = "Errore nella risposta";
   } finally {
     state.chatBusy = false;
     elements.sendQuestion.disabled = !state.chatConfigured;
     elements.question.focus();
+  }
+}
+
+async function saveChatSettings(event) {
+  event.preventDefault();
+  const settings = {
+    model: elements.chatModel.value,
+    embedding_model: elements.chatEmbeddingModel.value,
+    top_k: Number(elements.chatTopK.value),
+    memory_mode: elements.chatMemory.value,
+    budget_tokens: Number(elements.chatBudget.value),
+    show_reasoning: elements.chatShowReasoning.checked,
+    show_interaction_cost: elements.chatShowInteractionCost.checked,
+  };
+  elements.saveSettings.disabled = true;
+  try {
+    state.chatSettings = await requestJSON("/api/chat/settings", {
+      method: "PUT",
+      body: JSON.stringify(settings),
+    });
+    state.settingsDirty = false;
+    renderChat(state.chatHistory);
+    showToast("Impostazioni salvate.");
+  } catch (error) {
+    showToast(error.message, true);
+  } finally {
+    elements.saveSettings.disabled = false;
   }
 }
 
@@ -608,12 +706,14 @@ elements.tableBody.addEventListener("click", (event) => {
 });
 
 elements.chatForm.addEventListener("submit", sendChat);
-elements.newChat.addEventListener("click", startNewChat);
-elements.chatMedicine.addEventListener("change", () => {
-  if (state.chatHistory.length) {
-    startNewChat();
-  }
+elements.settingsForm.addEventListener("submit", saveChatSettings);
+elements.settingsForm.addEventListener("input", () => {
+  state.settingsDirty = true;
 });
+elements.settingsForm.addEventListener("change", () => {
+  state.settingsDirty = true;
+});
+elements.newChat.addEventListener("click", startNewChat);
 elements.question.addEventListener("keydown", (event) => {
   if (event.key === "Enter" && !event.shiftKey) {
     event.preventDefault();

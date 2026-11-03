@@ -14,7 +14,11 @@ from backend.chat_service import ChatService, ChatUnavailableError
 from backend.database import Database
 from backend.errors import APIError
 from backend.leaflets import LeafletStore, fetch_aifa_pdf
-from backend.repositories import MedicineRepository, StockRepository
+from backend.repositories import (
+    ChatSettingsRepository,
+    MedicineRepository,
+    StockRepository,
+)
 
 
 class RequestHandler(BaseHTTPRequestHandler):
@@ -39,6 +43,10 @@ class RequestHandler(BaseHTTPRequestHandler):
                 return
             elif parsed.path == "/api/chat/config":
                 result = self.chat_service.configuration()
+            elif parsed.path == "/api/chat/settings":
+                result = ChatSettingsRepository(
+                    self.database, self.chat_service.configuration()
+                ).get()
             elif re.fullmatch(r"/api/chat/session/[^/]+", parsed.path):
                 session_id = unquote(parsed.path.rsplit("/", 1)[1])
                 result = self.chat_service.session(session_id)
@@ -80,6 +88,26 @@ class RequestHandler(BaseHTTPRequestHandler):
                         ) from error
                 finally:
                     staged_path.unlink(missing_ok=True)
+                try:
+                    settings = ChatSettingsRepository(
+                        self.database, self.chat_service.configuration()
+                    ).get()
+                    self.chat_service.index_medicine(
+                        medicine_id, settings["embedding_model"]
+                    )
+                    result["embedding_status"] = "indexed"
+                except ChatUnavailableError as error:
+                    result["embedding_status"] = "pending"
+                    result["embedding_message"] = str(error)
+                except Exception:
+                    logging.exception(
+                        "Farmaco salvato ma indicizzazione del bugiardino non riuscita"
+                    )
+                    result["embedding_status"] = "failed"
+                    result["embedding_message"] = (
+                        "Farmaco salvato, ma l'indicizzazione non è riuscita. "
+                        "Controlla la connessione e il terminale."
+                    )
             elif urlsplit(self.path).path == "/api/chat":
                 result = self.chat_service.respond(self._read_json_body())
             elif urlsplit(self.path).path == "/api/stock":
@@ -113,6 +141,10 @@ class RequestHandler(BaseHTTPRequestHandler):
                 result = MedicineRepository(self.database).update(
                     unquote(parts[2]), data
                 )
+            elif parts == ["api", "chat", "settings"]:
+                result = ChatSettingsRepository(
+                    self.database, self.chat_service.configuration()
+                ).update(data)
             elif len(parts) == 3 and parts[:2] == ["api", "stock"]:
                 result = StockRepository(self.database).update(
                     self._parse_id(parts[2]), data

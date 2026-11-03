@@ -1,9 +1,11 @@
 import hashlib
 import json
+import logging
 import os
 import re
 import tempfile
 import unicodedata
+from datetime import date
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
@@ -18,13 +20,24 @@ from backend.repositories import MedicineRepository, StockRepository
 load_dotenv(ROOT_DIR / ".env")
 
 CHAT_MODELS = ("gpt-4o-mini", "gpt-4.1-mini")
-EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+EMBEDDING_MODELS = ("text-embedding-3-small", "text-embedding-3-large")
+DEFAULT_EMBEDDING_MODEL = EMBEDDING_MODELS[0]
+MODEL_PRICES_USD_PER_MILLION = {
+    "gpt-4o-mini": (0.15, 0.60),
+    "gpt-4.1-mini": (0.40, 1.60),
+}
+EMBEDDING_PRICES_USD_PER_MILLION = {
+    "text-embedding-3-small": 0.02,
+    "text-embedding-3-large": 0.13,
+}
 MAX_MESSAGE_LENGTH = 4_000
 SESSION_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,80}\Z")
 INSTRUCTIONS = """Sei l'assistente informativo di iFarmaco. Per le domande cliniche
 usa solo il contenuto dei foglietti illustrativi forniti nel turno corrente e
 cita la fonte nel formato [Nome farmaco, p. N]. Se i documenti non contengono la
-risposta, dichiaralo chiaramente e non inventare informazioni. Non formulare
+risposta, dichiaralo chiaramente e non inventare informazioni. Se la domanda non
+nomina un farmaco, usa i passaggi pertinenti dell'intero corpus indicizzato e
+cita ogni farmaco e pagina. Non formulare
 diagnosi né prescrivere, sospendere o modificare terapie; per consigli
 personali rimanda a medico o farmacista. In caso di possibile emergenza, invita
 l'utente a contattare subito i servizi di emergenza. Per domande su quantità,
@@ -53,7 +66,11 @@ INVENTORY_TOOL = {
     "strict": True,
 }
 INVENTORY_TERMS = re.compile(
-    r"\b(scorte?|giacenze?|disponibilit[aà])\b", re.IGNORECASE
+    r"\b(scorte?|giacenze?|disponibilit[aà]|scadut[oi]|scadenz[ae])\b",
+    re.IGNORECASE,
+)
+EXPIRY_QUESTION = re.compile(
+    r"\bscadut[oi]\b", re.IGNORECASE
 )
 INVENTORY_QUANTITY = re.compile(
     r"\b(quante?|quanti)\b.*\b(ho|restano|rimangono|disponibili|"
@@ -61,6 +78,12 @@ INVENTORY_QUANTITY = re.compile(
     re.IGNORECASE,
 )
 DOSAGE_FREQUENCY = re.compile(r"\b(quante?|quanti)\s+volte\b", re.IGNORECASE)
+SYMPTOM_SEARCH_TERMS = {
+    "mal di testa": ("mal di testa", "cefalea"),
+    "cefalea": ("cefalea", "mal di testa"),
+    "emicrania": ("emicrania",),
+    "headache": ("headache", "cefalea", "mal di testa"),
+}
 
 
 class ChatUnavailableError(Exception):
@@ -80,18 +103,94 @@ class ChatService:
         self.sessions_dir = sessions_dir
         self.chroma_dir = chroma_dir
         self._client: Any = None
-        self._collection: Any = None
+        self._vector_client: Any = None
+        self._collections: dict[str, Any] = {}
 
     @staticmethod
     def configuration() -> dict[str, Any]:
-        default_model = os.getenv("OPENAI_CHAT_MODEL", CHAT_MODELS[0])
-        if default_model not in CHAT_MODELS:
-            default_model = CHAT_MODELS[0]
         return {
             "configured": bool(os.getenv("OPENAI_API_KEY", "").strip()),
             "models": list(CHAT_MODELS),
-            "default_model": default_model,
+            "default_model": CHAT_MODELS[0],
+            "embedding_models": list(EMBEDDING_MODELS),
+            "default_embedding_model": DEFAULT_EMBEDDING_MODEL,
         }
+
+    @staticmethod
+    def _record_usage(
+        usage_records: list[dict[str, Any]] | None,
+        model: str,
+        response: Any,
+        *,
+        embeddings: bool = False,
+    ) -> None:
+        if usage_records is None:
+            return
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            usage_records.append({"model": model, "usage_unavailable": True})
+            return
+        if embeddings:
+            input_tokens = getattr(
+                usage, "prompt_tokens", getattr(usage, "total_tokens", None)
+            )
+            output_tokens = 0
+        else:
+            input_tokens = getattr(usage, "input_tokens", None)
+            output_tokens = getattr(usage, "output_tokens", None)
+        if (
+            type(input_tokens) is not int
+            or type(output_tokens) is not int
+            or input_tokens < 0
+            or output_tokens < 0
+        ):
+            usage_records.append({"model": model, "usage_unavailable": True})
+            return
+        usage_records.append(
+            {
+                "model": model,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "embeddings": embeddings,
+            }
+        )
+
+    @staticmethod
+    def _estimate_interaction_cost(
+        usage_records: list[dict[str, Any]],
+    ) -> float | None:
+        if any(record.get("usage_unavailable") for record in usage_records):
+            return None
+        cost = 0.0
+        for record in usage_records:
+            if record["embeddings"]:
+                price = EMBEDDING_PRICES_USD_PER_MILLION[record["model"]]
+                cost += record["input_tokens"] * price / 1_000_000
+            else:
+                input_price, output_price = MODEL_PRICES_USD_PER_MILLION[
+                    record["model"]
+                ]
+                cost += (
+                    record["input_tokens"] * input_price
+                    + record["output_tokens"] * output_price
+                ) / 1_000_000
+        return round(cost, 8)
+
+    def _response_details(
+        self,
+        *,
+        show_reasoning: bool,
+        reasoning: str,
+        usage_records: list[dict[str, Any]] | None,
+    ) -> dict[str, Any]:
+        details: dict[str, Any] = {}
+        if show_reasoning and reasoning:
+            details["reasoning"] = reasoning
+        if usage_records is not None:
+            cost = self._estimate_interaction_cost(usage_records)
+            if cost is not None:
+                details["interaction_cost_usd"] = cost
+        return details
 
     def session(self, session_id: str) -> dict[str, Any]:
         path = self._session_path(session_id)
@@ -148,8 +247,21 @@ class ChatService:
                 for medicine_id in saved["medicine_ids"]
             ]
         model = payload.get("model", configuration["default_model"])
-        if model not in CHAT_MODELS:
+        if not isinstance(model, str) or model not in CHAT_MODELS:
             raise ValueError("Modello non supportato.")
+        embedding_model = payload.get(
+            "embedding_model", configuration["default_embedding_model"]
+        )
+        if (
+            not isinstance(embedding_model, str)
+            or embedding_model not in EMBEDDING_MODELS
+        ):
+            raise ValueError("Modello di ricerca non supportato.")
+        show_reasoning = payload.get("show_reasoning", False)
+        show_interaction_cost = payload.get("show_interaction_cost", False)
+        if type(show_reasoning) is not bool or type(show_interaction_cost) is not bool:
+            raise ValueError("Le preferenze di visualizzazione devono essere booleane.")
+        usage_records = [] if show_interaction_cost else None
         try:
             top_k = int(payload.get("top_k", 4))
             budget = int(payload.get("budget_tokens", 700))
@@ -163,7 +275,140 @@ class ChatService:
 
         history = saved["messages"][-100:]
         inventory_question = self._is_inventory_question(message)
-        if not medicines and not inventory_question:
+        if EXPIRY_QUESTION.search(message):
+            expiry_medicines = mentioned or MedicineRepository(self.database).list()
+            expired = self._expired_stock(expiry_medicines)
+            if expired:
+                details = []
+                for medicine in expired:
+                    lots = ", ".join(
+                        f"{lot['nr_pezzi']} pezzi (scadenza "
+                        f"{date.fromisoformat(lot['data_scadenza']).strftime('%d/%m/%Y')})"
+                        for lot in medicine["lotti"]
+                    )
+                    details.append(f"- {medicine['nome']}: {lots}")
+                answer = "Risultano queste scorte scadute:\n" + "\n".join(details)
+            else:
+                answer = "Non risultano scorte scadute tra i farmaci registrati."
+            medicine_ids = [medicine["medicine_id"] for medicine in expired]
+            assistant_message = {
+                "role": "assistant",
+                "content": answer,
+                "sources": [],
+            }
+            assistant_message.update(
+                self._response_details(
+                    show_reasoning=show_reasoning,
+                    reasoning=(
+                        "Ho controllato le date di scadenza dei lotti registrati "
+                        "nel database locale."
+                    ),
+                    usage_records=usage_records,
+                )
+            )
+            history.extend(
+                [{"role": "user", "content": message}, assistant_message]
+            )
+            self._truncate(history, budget)
+            self._save_session(session_path, history, medicine_ids)
+            return {
+                "session_id": session_id,
+                "medicine_id": medicine_ids[0] if medicine_ids else "",
+                "medicine_ids": medicine_ids,
+                "medicine_names": [
+                    medicine["nome"] for medicine in expired
+                ],
+                "answer": answer,
+                "searched_query": message,
+                "sources": [],
+                "messages": history,
+            }
+        normalized_message = self._normalize_medicine_name(message)
+        padded_message = f" {normalized_message} "
+        has_supported_symptom = any(
+            f" {symptom} " in padded_message for symptom in SYMPTOM_SEARCH_TERMS
+        )
+        if not medicines and not inventory_question and has_supported_symptom:
+            symptom_search = self._search_available_leaflets(message)
+            if symptom_search is not None:
+                matches = symptom_search["matches"]
+                if matches:
+                    entries = "\n".join(
+                        f"- {match['name']}: {match['pezzi_non_scaduti']} pezzi non scaduti; "
+                        f"riferimento nel bugiardino a pagina {match['page']}."
+                        for match in matches
+                    )
+                    answer = (
+                        f"Nei bugiardini consultati ho trovato un riferimento a "
+                        f"{symptom_search['symptom']} nella sezione sulle indicazioni per questi "
+                        f"farmaci con scorte non scadute:\n{entries}\n"
+                        "Questo elenco non stabilisce quale farmaco sia adatto a te e non è "
+                        "un consiglio di assunzione. Verifica il foglietto e chiedi al medico "
+                        "o al farmacista, soprattutto se assumi altri farmaci o hai patologie."
+                    )
+                else:
+                    answer = (
+                        f"Nei bugiardini consultabili non ho trovato un'indicazione d'uso "
+                        f"che menzioni {symptom_search['symptom']} per farmaci con scorte "
+                        "non scadute."
+                    )
+                if symptom_search["unavailable"]:
+                    answer += (
+                        f" Non ho potuto controllare {symptom_search['unavailable']} "
+                        "bugiardini di farmaci disponibili: "
+                        f"{symptom_search['missing_pdfs']} PDF mancanti e "
+                        f"{symptom_search['unrecognized_sections']} sezioni non riconosciute."
+                    )
+                sources = [
+                    {
+                        "id": match["name"],
+                        "medicine_id": match["medicine_id"],
+                        "page": match["page"],
+                        "score": 1.0,
+                        "url": (
+                            f"/api/medicines/{match['medicine_id']}/leaflet"
+                            f"#page={match['page']}"
+                        ),
+                    }
+                    for match in matches
+                ]
+                medicine_ids = [match["medicine_id"] for match in matches]
+                assistant_message = {
+                    "role": "assistant",
+                    "content": answer,
+                    "sources": sources,
+                }
+                assistant_message.update(
+                    self._response_details(
+                        show_reasoning=show_reasoning,
+                        reasoning=(
+                            "Ho cercato riferimenti nelle sezioni delle indicazioni "
+                            "dei bugiardini disponibili. Le pagine collegate mostrano "
+                            "i passaggi usati; il confronto non indica quale farmaco "
+                            "sia adatto alla persona."
+                        ),
+                        usage_records=usage_records,
+                    )
+                )
+                history.extend(
+                    [
+                        {"role": "user", "content": message},
+                        assistant_message,
+                    ]
+                )
+                self._truncate(history, budget)
+                self._save_session(session_path, history, medicine_ids)
+                return {
+                    "session_id": session_id,
+                    "medicine_id": medicine_ids[0] if medicine_ids else "",
+                    "medicine_ids": medicine_ids,
+                    "medicine_names": [match["name"] for match in matches],
+                    "answer": answer,
+                    "searched_query": message,
+                    "sources": sources,
+                    "messages": history,
+                    "needs_clarification": False,
+                }
             answer = (
                 "A quale farmaco ti riferisci? Puoi scriverne il nome nella domanda; "
                 "per confrontarne più di uno, includi tutti i nomi."
@@ -171,7 +416,20 @@ class ChatService:
             history.extend(
                 [
                     {"role": "user", "content": message},
-                    {"role": "assistant", "content": answer, "sources": []},
+                    {
+                        "role": "assistant",
+                        "content": answer,
+                        **self._response_details(
+                            show_reasoning=show_reasoning,
+                            reasoning=(
+                                "Non ho identificato con certezza il farmaco nella "
+                                "domanda o nella conversazione. Chiedo un chiarimento "
+                                "prima di consultare un bugiardino."
+                            ),
+                            usage_records=usage_records,
+                        ),
+                        "sources": [],
+                    },
                 ]
             )
             self._truncate(history, budget)
@@ -198,6 +456,7 @@ class ChatService:
                 history,
                 message,
                 [medicine["nome"] for medicine in medicines],
+                usage_records=usage_records,
             )
             medicine_ids = list(
                 dict.fromkeys(
@@ -212,18 +471,81 @@ class ChatService:
             ]
             searched_query = message
             chunks = []
+            reasoning = (
+                "Ho verificato le giacenze nel database locale"
+                + (
+                    f" per {', '.join(medicine_names)}."
+                    if medicine_names
+                    else " per i farmaci individuati nella domanda."
+                )
+            )
         else:
             medicine_names = [medicine["nome"] for medicine in medicines]
+            search_scope = ", ".join(medicine_names) or "tutti i bugiardini indicizzati"
+            condense_arguments = (
+                {"usage_records": usage_records}
+                if usage_records is not None
+                else {}
+            )
             searched_query = self._condense(
-                client, model, history, message, ", ".join(medicine_names)
+                client,
+                model,
+                history,
+                message,
+                search_scope,
+                **condense_arguments,
             )
             chunks = []
-            for medicine in medicines:
-                chunks.extend(self._retrieve(client, medicine, searched_query, top_k))
+            if medicines:
+                for medicine in medicines:
+                    chunks.extend(
+                        self._retrieve(
+                            client,
+                            medicine,
+                            searched_query,
+                            top_k,
+                            embedding_model,
+                            usage_records=usage_records,
+                        )
+                    )
+            else:
+                chunks = self._retrieve_all(
+                    client,
+                    searched_query,
+                    top_k,
+                    embedding_model,
+                    usage_records=usage_records,
+                )
             chunks.sort(key=lambda chunk: chunk["score"], reverse=True)
             chunks = chunks[:top_k]
-            answer = self._generate(client, model, chunks, searched_query, history)
-            medicine_ids = [medicine["id"] for medicine in medicines]
+            answer = (
+                self._generate(
+                    client,
+                    model,
+                    chunks,
+                    searched_query,
+                    history,
+                    usage_records=usage_records,
+                )
+                if chunks
+                else "Non trovo informazioni pertinenti nei bugiardini indicizzati."
+            )
+            if medicines:
+                medicine_ids = [medicine["id"] for medicine in medicines]
+                reasoning = (
+                    f"Ho cercato “{searched_query}” nel bugiardino di "
+                    f"{', '.join(medicine_names)} e ho selezionato {len(chunks)} "
+                    "passaggi per pertinenza. Puoi verificare le pagine nelle fonti."
+                )
+            else:
+                medicine_ids = list(
+                    dict.fromkeys(chunk["medicine_id"] for chunk in chunks)
+                )
+                medicine_names = list(dict.fromkeys(chunk["id"] for chunk in chunks))
+                reasoning = (
+                    f"Ho cercato “{searched_query}” in tutti i bugiardini indicizzati "
+                    f"e selezionato {len(chunks)} passaggi per pertinenza."
+                )
         sources = [
             {
                 "id": chunk["id"],
@@ -234,16 +556,31 @@ class ChatService:
             }
             for chunk in chunks
         ]
+        assistant_message = {
+            "role": "assistant",
+            "content": answer,
+            "sources": sources,
+        }
+        assistant_message.update(
+            self._response_details(
+                show_reasoning=show_reasoning,
+                reasoning=reasoning,
+                usage_records=None,
+            )
+        )
         history.extend(
-            [
-                {"role": "user", "content": message},
-                {"role": "assistant", "content": answer, "sources": sources},
-            ]
+            [{"role": "user", "content": message}, assistant_message]
         )
         if memory_mode == "summary":
-            self._summarize_if_needed(client, model, history, budget)
+            self._summarize_if_needed(
+                client, model, history, budget, usage_records=usage_records
+            )
         else:
             self._truncate(history, budget)
+        if usage_records is not None:
+            cost = self._estimate_interaction_cost(usage_records)
+            if cost is not None:
+                assistant_message["interaction_cost_usd"] = cost
         self._save_session(session_path, history, medicine_ids)
 
         return {
@@ -264,6 +601,7 @@ class ChatService:
         history: list[dict[str, str]],
         message: str,
         selected_medicines: list[str],
+        usage_records: list[dict[str, Any]] | None = None,
     ) -> tuple[str, list[dict[str, Any]]]:
         medicine_context = (
             ", ".join(selected_medicines) if selected_medicines else "nessuno selezionato"
@@ -291,6 +629,7 @@ class ChatService:
                 tools=[INVENTORY_TOOL],
                 tool_choice="auto",
             )
+            self._record_usage(usage_records, model, response)
             calls = [
                 item
                 for item in response.output
@@ -335,6 +674,7 @@ class ChatService:
             tools=[INVENTORY_TOOL],
             tool_choice="none",
         )
+        self._record_usage(usage_records, model, response)
         return response.output_text.strip(), results
 
     def _execute_inventory_tool(self, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -373,6 +713,27 @@ class ChatService:
                 }
             )
         return {"query": medicine_name, "matches": matches}
+
+    def _expired_stock(
+        self, medicines: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        stock = StockRepository(self.database)
+        expired_medicines = []
+        for medicine in medicines:
+            lots = [
+                lot
+                for lot in stock.for_medicine(medicine["id"])
+                if not lot["non_scaduto"]
+            ]
+            if lots:
+                expired_medicines.append(
+                    {
+                        "medicine_id": medicine["id"],
+                        "nome": medicine["nome"],
+                        "lotti": lots,
+                    }
+                )
+        return expired_medicines
 
     def _match_inventory_medicines(self, query: str) -> list[dict[str, Any]]:
         normalized_query = self._normalize_medicine_name(query)
@@ -417,6 +778,118 @@ class ChatService:
             and not DOSAGE_FREQUENCY.search(message)
         )
 
+    def _search_available_leaflets(self, message: str) -> dict[str, Any] | None:
+        normalized_message = self._normalize_medicine_name(message)
+        padded_message = f" {normalized_message} "
+        symptom = next(
+            (
+                label
+                for label in SYMPTOM_SEARCH_TERMS
+                if f" {label} " in padded_message
+            ),
+            None,
+        )
+        if symptom is None:
+            return None
+
+        from pypdf import PdfReader
+
+        search_terms = SYMPTOM_SEARCH_TERMS[symptom]
+        stock = StockRepository(self.database)
+        matches = []
+        missing_pdfs = 0
+        unrecognized_sections = 0
+        for medicine in MedicineRepository(self.database).list():
+            lots = stock.for_medicine(medicine["id"])
+            available_pieces = sum(
+                lot["nr_pezzi"] for lot in lots if lot["non_scaduto"]
+            )
+            if available_pieces <= 0:
+                continue
+
+            path = self.leaflet_store.find(medicine["id"])
+            if path is None:
+                missing_pdfs += 1
+                continue
+            page_texts = [
+                self._normalize_medicine_name(page.extract_text() or "")
+                for page in PdfReader(str(path)).pages
+            ]
+            section = self._indication_section(page_texts)
+            if section is None:
+                unrecognized_sections += 1
+                continue
+            section_text, section_start = section
+            term_matches = [
+                (match.start(), term)
+                for term in search_terms
+                if (match := re.search(rf"\b{re.escape(term)}\b", section_text))
+            ]
+            if not term_matches:
+                continue
+
+            term_offset, _ = min(term_matches)
+            absolute_offset = section_start + term_offset
+            page_number = 1
+            page_offset = 0
+            for index, page_text in enumerate(page_texts, start=1):
+                if absolute_offset <= page_offset + len(page_text):
+                    page_number = index
+                    break
+                page_offset += len(page_text) + 1
+            matches.append(
+                {
+                    "medicine_id": medicine["id"],
+                    "name": medicine["nome"],
+                    "pezzi_non_scaduti": available_pieces,
+                    "page": page_number,
+                }
+            )
+
+        return {
+            "symptom": symptom,
+            "matches": matches,
+            "missing_pdfs": missing_pdfs,
+            "unrecognized_sections": unrecognized_sections,
+            "unavailable": missing_pdfs + unrecognized_sections,
+        }
+
+    @staticmethod
+    def _indication_section(page_texts: list[str]) -> tuple[str, int] | None:
+        full_text = "\n".join(page_texts)
+        headings = [
+            match.end()
+            for match in re.finditer(
+                r"\b(?:a (?:che )?cosa|e cosa) serve\b", full_text
+            )
+        ]
+        sections = []
+        for start in headings:
+            end = re.search(
+                r"\b2\s+(?:cosa deve sapere|cosa deve fare|prima di prendere)\b",
+                full_text[start:],
+            )
+            if end:
+                section_end = start + end.start()
+                if section_end > start:
+                    sections.append((full_text[start:section_end], start))
+        if not sections:
+            starts = [
+                match.end()
+                for match in re.finditer(r"\bindicazioni terapeutiche\b", full_text)
+            ]
+            for start in starts:
+                end = re.search(
+                    r"\b(?:controindicazioni|posologia|modalita di somministrazione|"
+                    r"avvertenze|effetti indesiderati|interazioni)\b",
+                    full_text[start:],
+                )
+                if end:
+                    section_end = start + end.start()
+                    if section_end > start:
+                        sections.append((full_text[start:section_end], start))
+        return max(sections, key=lambda section: len(section[0])) if sections else None
+
     def _openai_client(self) -> Any:
         if self._client is None:
             from openai import OpenAI
@@ -424,20 +897,73 @@ class ChatService:
             self._client = OpenAI()
         return self._client
 
-    def _vector_collection(self) -> Any:
-        if self._collection is None:
+    def _vector_collection(
+        self, embedding_model: str = DEFAULT_EMBEDDING_MODEL
+    ) -> Any:
+        if embedding_model not in self._collections:
             import chromadb
 
-            self.chroma_dir.mkdir(parents=True, exist_ok=True)
-            client = chromadb.PersistentClient(path=str(self.chroma_dir))
-            self._collection = client.get_or_create_collection(
-                "ifarmaco_leaflets", metadata={"hnsw:space": "cosine"}
+            if self._vector_client is None:
+                self.chroma_dir.mkdir(parents=True, exist_ok=True)
+                self._vector_client = chromadb.PersistentClient(
+                    path=str(self.chroma_dir)
+                )
+            collection_name = (
+                "ifarmaco_leaflets"
+                if embedding_model == DEFAULT_EMBEDDING_MODEL
+                else f"ifarmaco_leaflets_{embedding_model.replace('-', '_')}"
             )
-        return self._collection
+            collection = self._vector_client.get_or_create_collection(
+                collection_name, metadata={"hnsw:space": "cosine"}
+            )
+            self._collections[embedding_model] = collection
+        return self._collections[embedding_model]
 
-    def _retrieve(
-        self, client: Any, medicine: dict[str, Any], query: str, top_k: int
-    ) -> list[dict[str, Any]]:
+    def index_all_medicines(
+        self, embedding_model: str = DEFAULT_EMBEDDING_MODEL
+    ) -> tuple[int, int, list[str]]:
+        if embedding_model not in EMBEDDING_MODELS:
+            raise ValueError("Modello di ricerca non supportato.")
+        if not self.configuration()["configured"]:
+            raise ChatUnavailableError("Configura OPENAI_API_KEY nel file .env.")
+
+        medicines = MedicineRepository(self.database).list()
+        client = self._openai_client()
+        newly_indexed = 0
+        failures = []
+        for position, medicine in enumerate(medicines, start=1):
+            logging.info(
+                "Indicizzazione bugiardino %d/%d: %s",
+                position,
+                len(medicines),
+                medicine["id"],
+            )
+            try:
+                _, created = self._ensure_medicine_indexed(
+                    client, medicine, embedding_model
+                )
+                newly_indexed += created
+            except Exception as error:
+                failures.append(f"{medicine['id']}: {error}")
+        return len(medicines), newly_indexed, failures
+
+    def index_medicine(self, medicine_id: str, embedding_model: str) -> None:
+        if embedding_model not in EMBEDDING_MODELS:
+            raise ValueError("Modello di ricerca non supportato.")
+        if not self.configuration()["configured"]:
+            raise ChatUnavailableError("Configura OPENAI_API_KEY nel file .env.")
+        medicine = MedicineRepository(self.database).get(medicine_id)
+        self._ensure_medicine_indexed(
+            self._openai_client(), medicine, embedding_model
+        )
+
+    def _ensure_medicine_indexed(
+        self,
+        client: Any,
+        medicine: dict[str, Any],
+        embedding_model: str,
+        usage_records: list[dict[str, Any]] | None = None,
+    ) -> tuple[dict[str, Any], bool]:
         path = self.leaflet_store.find(medicine["id"])
         if path is None:
             source_url = medicine.get("bugiardino_url", "")
@@ -454,56 +980,124 @@ class ChatService:
 
         pages = PdfReader(str(path)).pages
         document_hash = hashlib.sha256(path.read_bytes()).hexdigest()[:16]
-        collection = self._vector_collection()
         where = {
             "$and": [
                 {"medicine_id": medicine["id"]},
                 {"document_hash": document_hash},
             ]
         }
-        indexed = collection.get(where=where, limit=1)
-        if not indexed["ids"]:
-            chunks = []
-            for page_number, page in enumerate(pages, start=1):
-                text = " ".join((page.extract_text() or "").split())
-                chunks.extend(
-                    {"page": page_number, "text": part}
-                    for part in self._split_text(text)
-                )
-            if not chunks:
-                raise ValueError("Il PDF non contiene testo leggibile per la ricerca.")
-            for offset in range(0, len(chunks), 64):
-                batch = chunks[offset : offset + 64]
-                embeddings = client.embeddings.create(
-                    model=EMBEDDING_MODEL, input=[item["text"] for item in batch]
-                )
-                collection.upsert(
-                    ids=[
-                        f"{medicine['id']}-{document_hash}-{offset + index}"
-                        for index in range(len(batch))
-                    ],
-                    documents=[item["text"] for item in batch],
-                    embeddings=[item.embedding for item in embeddings.data],
-                    metadatas=[
-                        {
-                            "medicine_id": medicine["id"],
-                            "document_hash": document_hash,
-                            "page": item["page"],
-                        }
-                        for item in batch
-                    ],
-                )
+        collection = self._vector_collection(embedding_model)
+        chunks = []
+        for page_number, page in enumerate(pages, start=1):
+            text = " ".join((page.extract_text() or "").split())
+            chunks.extend(
+                {"page": page_number, "text": part}
+                for part in self._split_text(text)
+            )
+        if not chunks:
+            raise ValueError("Il PDF non contiene testo leggibile per la ricerca.")
+        expected_ids = {
+            f"{medicine['id']}-{document_hash}-{index}"
+            for index in range(len(chunks))
+        }
+        indexed_ids = set(collection.get(where=where)["ids"])
+        if expected_ids.issubset(indexed_ids):
+            return where, False
+        for offset in range(0, len(chunks), 64):
+            batch = chunks[offset : offset + 64]
+            embeddings = client.embeddings.create(
+                model=embedding_model, input=[item["text"] for item in batch]
+            )
+            self._record_usage(
+                usage_records, embedding_model, embeddings, embeddings=True
+            )
+            collection.upsert(
+                ids=[
+                    f"{medicine['id']}-{document_hash}-{offset + index}"
+                    for index in range(len(batch))
+                ],
+                documents=[item["text"] for item in batch],
+                embeddings=[item.embedding for item in embeddings.data],
+                metadatas=[
+                    {
+                        "medicine_id": medicine["id"],
+                        "document_hash": document_hash,
+                        "page": item["page"],
+                    }
+                    for item in batch
+                ],
+            )
+        return where, True
 
+    def _retrieve(
+        self,
+        client: Any,
+        medicine: dict[str, Any],
+        query: str,
+        top_k: int,
+        embedding_model: str = DEFAULT_EMBEDDING_MODEL,
+        usage_records: list[dict[str, Any]] | None = None,
+    ) -> list[dict[str, Any]]:
+        where, _ = self._ensure_medicine_indexed(
+            client, medicine, embedding_model, usage_records
+        )
+        collection = self._vector_collection(embedding_model)
         query_embedding = client.embeddings.create(
-            model=EMBEDDING_MODEL, input=[query]
-        ).data[0].embedding
+            model=embedding_model, input=[query]
+        )
+        self._record_usage(
+            usage_records, embedding_model, query_embedding, embeddings=True
+        )
         result = collection.query(
-            query_embeddings=[query_embedding], n_results=top_k, where=where
+            query_embeddings=[query_embedding.data[0].embedding],
+            n_results=top_k,
+            where=where,
         )
         return [
             {
                 "id": medicine["nome"],
                 "medicine_id": medicine["id"],
+                "text": result["documents"][0][index],
+                "page": result["metadatas"][0][index]["page"],
+                "score": 1 - result["distances"][0][index],
+            }
+            for index in range(len(result["ids"][0]))
+        ]
+
+    def _retrieve_all(
+        self,
+        client: Any,
+        query: str,
+        top_k: int,
+        embedding_model: str = DEFAULT_EMBEDDING_MODEL,
+        usage_records: list[dict[str, Any]] | None = None,
+    ) -> list[dict[str, Any]]:
+        collection = self._vector_collection(embedding_model)
+        count = collection.count()
+        if count == 0:
+            return []
+
+        query_embedding = client.embeddings.create(
+            model=embedding_model, input=[query]
+        )
+        self._record_usage(
+            usage_records, embedding_model, query_embedding, embeddings=True
+        )
+        result = collection.query(
+            query_embeddings=[query_embedding.data[0].embedding],
+            n_results=min(top_k, count),
+        )
+        medicine_names = {
+            medicine["id"]: medicine["nome"]
+            for medicine in MedicineRepository(self.database).list()
+        }
+        return [
+            {
+                "id": medicine_names.get(
+                    result["metadatas"][0][index]["medicine_id"],
+                    result["metadatas"][0][index]["medicine_id"],
+                ),
+                "medicine_id": result["metadatas"][0][index]["medicine_id"],
                 "text": result["documents"][0][index],
                 "page": result["metadatas"][0][index]["page"],
                 "score": 1 - result["distances"][0][index],
@@ -561,6 +1155,7 @@ class ChatService:
         history: list[dict[str, str]],
         message: str,
         medicine: str,
+        usage_records: list[dict[str, Any]] | None = None,
     ) -> str:
         if not history:
             return message
@@ -581,6 +1176,7 @@ class ChatService:
                 }
             ],
         )
+        self._record_usage(usage_records, model, result)
         return result.output_text.strip() or message
 
     @staticmethod
@@ -590,6 +1186,7 @@ class ChatService:
         chunks: list[dict[str, Any]],
         question: str,
         history: list[dict[str, str]],
+        usage_records: list[dict[str, Any]] | None = None,
     ) -> str:
         documents = "\n\n".join(
             f"<documento farmaco=\"{chunk['id']}\" pagina=\"{chunk['page']}\">\n"
@@ -606,6 +1203,7 @@ class ChatService:
             ]
             + [{"role": "user", "content": prompt}],
         )
+        ChatService._record_usage(usage_records, model, result)
         return result.output_text.strip()
 
     def _summarize_if_needed(
@@ -614,6 +1212,7 @@ class ChatService:
         model: str,
         history: list[dict[str, str]],
         budget: int,
+        usage_records: list[dict[str, Any]] | None = None,
     ) -> None:
         if self._count_tokens(history) <= budget or len(history) <= 2:
             return
@@ -634,6 +1233,7 @@ class ChatService:
                 }
             ],
         )
+        self._record_usage(usage_records, model, result)
         summary = result.output_text.strip()
         history[:] = [
             {"role": "user", "content": f"Riassunto della conversazione: {summary}"},

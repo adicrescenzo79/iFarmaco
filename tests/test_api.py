@@ -13,6 +13,7 @@ from urllib.request import Request, urlopen
 
 from backend.database import Database
 from backend.leaflets import LeafletStore
+from backend.repositories import ChatSettingsRepository
 from backend.server import create_server
 
 
@@ -100,21 +101,29 @@ class APITests(unittest.TestCase):
         return output.getvalue()
 
     def test_medicine_and_stock_crud(self) -> None:
-        status, medicine = self.request_multipart(
-            "/api/medicines",
-            {
-                "id": "00099",
-                "nome": "Farmaco API",
-                "casa_produttrice": "Produttore",
-                "formato": "Compressa",
-                "quantita": "10 mg",
-                "bugiardino_url": "",
-            },
-            "bugiardino.pdf",
-            self.sample_pdf(),
-        )
+        _, chat_settings = self.request("GET", "/api/chat/settings")
+        with patch.object(
+            self.server.RequestHandlerClass.chat_service, "index_medicine"
+        ) as index_medicine:
+            status, medicine = self.request_multipart(
+                "/api/medicines",
+                {
+                    "id": "00099",
+                    "nome": "Farmaco API",
+                    "casa_produttrice": "Produttore",
+                    "formato": "Compressa",
+                    "quantita": "10 mg",
+                    "bugiardino_url": "",
+                },
+                "bugiardino.pdf",
+                self.sample_pdf(),
+            )
         self.assertEqual(status, 201)
         self.assertIsInstance(medicine, dict)
+        self.assertEqual(medicine["embedding_status"], "indexed")
+        index_medicine.assert_called_once_with(
+            "00099", chat_settings["embedding_model"]
+        )
         self.assertTrue(self.leaflet_store.find("00099").is_file())
         connection = HTTPConnection("127.0.0.1", self.server.server_port, timeout=3)
         connection.request("GET", "/api/medicines/00099/leaflet")
@@ -162,6 +171,23 @@ class APITests(unittest.TestCase):
         status, _ = self.request("DELETE", f"/api/stock/{stock_id}")
         self.assertEqual(status, 200)
 
+    def test_medicine_upload_survives_embedding_failure(self) -> None:
+        with patch.object(
+            self.server.RequestHandlerClass.chat_service,
+            "index_medicine",
+            side_effect=RuntimeError("provider unavailable"),
+        ):
+            status, payload = self.request_multipart(
+                "/api/medicines",
+                {"id": "00096", "nome": "Farmaco senza embedding"},
+                "bugiardino.pdf",
+                self.sample_pdf(),
+            )
+
+        self.assertEqual(status, 201)
+        self.assertEqual(payload["embedding_status"], "failed")
+        self.assertTrue(self.leaflet_store.find("00096").is_file())
+
     def test_new_medicine_requires_a_leaflet_upload(self) -> None:
         status, payload = self.request(
             "POST",
@@ -196,6 +222,98 @@ class APITests(unittest.TestCase):
             )
         self.assertEqual(status, 503)
         self.assertIn("OPENAI_API_KEY", payload["error"])
+
+    def test_chat_settings_are_saved_and_validated(self) -> None:
+        status, settings = self.request("GET", "/api/chat/settings")
+        self.assertEqual(status, 200)
+        self.assertEqual(settings["model"], "gpt-4o-mini")
+        self.assertEqual(settings["embedding_model"], "text-embedding-3-small")
+        self.assertEqual(settings["top_k"], 4)
+        self.assertEqual(settings["memory_mode"], "buffer")
+        self.assertEqual(settings["budget_tokens"], 700)
+        self.assertFalse(settings["show_reasoning"])
+        self.assertFalse(settings["show_interaction_cost"])
+        with self.server.RequestHandlerClass.database.connect() as connection:
+            row = connection.execute(
+                "SELECT valore FROM app_metadata WHERE chiave = 'chat_settings'"
+            ).fetchone()
+        self.assertEqual(json.loads(row["valore"]), settings)
+
+        updated = {
+            "model": "gpt-4.1-mini",
+            "embedding_model": "text-embedding-3-large",
+            "top_k": 6,
+            "memory_mode": "summary",
+            "budget_tokens": 1_200,
+            "show_reasoning": True,
+            "show_interaction_cost": True,
+        }
+        status, saved = self.request("PUT", "/api/chat/settings", updated)
+        self.assertEqual(status, 200)
+        self.assertEqual(saved, updated)
+
+        status, persisted = self.request("GET", "/api/chat/settings")
+        self.assertEqual(status, 200)
+        self.assertEqual(persisted, updated)
+
+        status, payload = self.request(
+            "PUT", "/api/chat/settings", {**updated, "top_k": 9}
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("fonti", payload["error"])
+
+        status, payload = self.request(
+            "PUT", "/api/chat/settings", {**updated, "embedding_model": "unknown"}
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("ricerca", payload["error"])
+
+        status, payload = self.request(
+            "PUT", "/api/chat/settings", {**updated, "show_reasoning": "true"}
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("booleano", payload["error"])
+
+    def test_existing_chat_settings_get_default_embedding_model(self) -> None:
+        database = Database(Path(self.temp_dir.name) / "legacy.sqlite3")
+        database.initialize()
+        with database.connect() as connection:
+            connection.execute(
+                "INSERT INTO app_metadata (chiave, valore) VALUES (?, ?)",
+                (
+                    "chat_settings",
+                    json.dumps(
+                        {
+                            "model": "gpt-4o-mini",
+                            "top_k": 4,
+                            "memory_mode": "buffer",
+                            "budget_tokens": 700,
+                        }
+                    ),
+                ),
+            )
+
+        repository = ChatSettingsRepository(
+            database,
+            {
+                "models": ["gpt-4o-mini", "gpt-4.1-mini"],
+                "default_model": "gpt-4o-mini",
+                "embedding_models": [
+                    "text-embedding-3-small",
+                    "text-embedding-3-large",
+                ],
+                "default_embedding_model": "text-embedding-3-small",
+            },
+        )
+        settings = repository.get()
+        self.assertEqual(settings["embedding_model"], "text-embedding-3-small")
+        self.assertFalse(settings["show_reasoning"])
+        self.assertFalse(settings["show_interaction_cost"])
+        with database.connect() as connection:
+            row = connection.execute(
+                "SELECT valore FROM app_metadata WHERE chiave = 'chat_settings'"
+            ).fetchone()
+        self.assertEqual(json.loads(row["valore"]), settings)
 
     def test_frontend_is_served_by_backend(self) -> None:
         connection = HTTPConnection("127.0.0.1", self.server.server_port, timeout=3)

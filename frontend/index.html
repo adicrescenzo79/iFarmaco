@@ -35,6 +35,10 @@
             <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M4 7.5 12 3l8 4.5v9L12 21l-8-4.5v-9Z" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/><path d="m4.5 7.8 7.5 4.3 7.5-4.3M12 12v8.5M8 5.2l8 4.6" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></svg>
             <span>Scorte</span>
           </a>
+          <a class="nav-item" href="#" data-view="settings">
+            <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 8.5a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7Z" stroke="currentColor" stroke-width="1.7"/><path d="m19.4 15 .1.1a1.8 1.8 0 1 1-2.5 2.5l-.1-.1a1.8 1.8 0 0 0-3 .8v.2a1.8 1.8 0 1 1-3.6 0v-.2a1.8 1.8 0 0 0-3-.8l-.1.1a1.8 1.8 0 1 1-2.5-2.5l.1-.1a1.8 1.8 0 0 0-.8-3H4a1.8 1.8 0 1 1 0-3.6h.2a1.8 1.8 0 0 0 .8-3l-.1-.1a1.8 1.8 0 1 1 2.5-2.5l.1.1a1.8 1.8 0 0 0 3-.8V2a1.8 1.8 0 1 1 3.6 0v.2a1.8 1.8 0 0 0 3 .8l.1-.1a1.8 1.8 0 1 1 2.5 2.5l-.1.1a1.8 1.8 0 0 0 .8 3h.2a1.8 1.8 0 1 1 0 3.6h-.2a1.8 1.8 0 0 0-.8 3Z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></svg>
+            <span>Impostazioni</span>
+          </a>
         </nav>
 
         <div class="sidebar-bottom">
@@ -70,37 +74,6 @@
             <p class="heading-copy">Fai una domanda sul tuo farmaco. Troverai risposte semplici, con i riferimenti al foglietto illustrativo.</p>
           </div>
 
-          <section class="chat-controls" aria-label="Impostazioni della chat">
-            <label class="chat-control">
-              <span>Filtro farmaco, facoltativo</span>
-              <select id="chat-medicine">
-                <option value="">Tutti quelli nominati nella domanda</option>
-              </select>
-            </label>
-            <label class="chat-control">
-              <span>Modello</span>
-              <select id="chat-model"></select>
-            </label>
-            <label class="chat-control compact-control">
-              <span>Fonti</span>
-              <input id="chat-top-k" type="number" min="1" max="8" value="4">
-            </label>
-            <label class="chat-control">
-              <span>Memoria</span>
-              <select id="chat-memory">
-                <option value="buffer">Buffer</option>
-                <option value="summary">Riassunto</option>
-              </select>
-            </label>
-            <label class="chat-control compact-control">
-              <span>Budget token</span>
-              <input id="chat-budget" type="number" min="150" max="4000" step="50" value="700">
-            </label>
-            <button class="new-chat-button" id="new-chat" type="button" title="Avvia una nuova conversazione">
-              <span aria-hidden="true">＋</span>
-              <span>Nuova chat</span>
-            </button>
-          </section>
           <div class="chat-setup-notice" id="chat-setup-notice" role="status" hidden></div>
 
           <section class="chat-card" aria-label="Conversazione">
@@ -114,7 +87,13 @@
                   <span><span class="online-dot" id="chat-status-dot"></span><span id="chat-status">Connessione in corso</span></span>
                 </div>
               </div>
-              <span class="session-label">SESSIONE LOCALE</span>
+              <div class="chat-header-actions">
+                <button class="new-chat-button" id="new-chat" type="button" title="Avvia una nuova conversazione">
+                  <span aria-hidden="true">＋</span>
+                  <span>Nuova chat</span>
+                </button>
+                <span class="session-label">SESSIONE LOCALE</span>
+              </div>
             </div>
 
             <div class="conversation" id="conversation" aria-live="polite" aria-relevant="additions text">
@@ -151,6 +130,119 @@
             </div>
           </div>
           </div>
+
+          <section class="settings-view" id="settings-view" hidden>
+            <div class="page-heading database-heading">
+              <div class="eyebrow"><span class="eyebrow-line"></span> PREFERENZE CHAT</div>
+              <h1>Impostazioni</h1>
+              <p class="heading-copy">Personalizza il modello e il modo in cui l’assistente consulta i bugiardini. Le scelte vengono salvate in questo dispositivo.</p>
+            </div>
+
+            <form class="settings-card" id="settings-form">
+              <section class="settings-section" aria-labelledby="settings-models-title">
+                <div class="settings-section-heading">
+                  <span class="settings-section-icon" aria-hidden="true">01</span>
+                  <div>
+                    <h2 id="settings-models-title">Modelli AI</h2>
+                    <p>Scegli come generare le risposte e cercare nei foglietti.</p>
+                  </div>
+                </div>
+                <div class="settings-fields">
+                  <label class="chat-control">
+                    <span>Modello di risposta</span>
+                    <select id="chat-model">
+                      <option value="gpt-4o-mini" selected>gpt-4o-mini · consigliato</option>
+                      <option value="gpt-4.1-mini">gpt-4.1-mini</option>
+                    </select>
+                    <small>Genera le risposte alle domande sui farmaci.</small>
+                  </label>
+                  <label class="chat-control">
+                    <span>Modello di ricerca</span>
+                    <select id="chat-embedding-model">
+                      <option value="text-embedding-3-small" selected>text-embedding-3-small · consigliato</option>
+                      <option value="text-embedding-3-large">text-embedding-3-large</option>
+                    </select>
+                    <small>Il modello consigliato riutilizza l’indice esistente. Un modello diverso ne crea uno separato.</small>
+                  </label>
+                </div>
+              </section>
+
+              <section class="settings-section" aria-labelledby="settings-search-title">
+                <div class="settings-section-heading">
+                  <span class="settings-section-icon" aria-hidden="true">02</span>
+                  <div>
+                    <h2 id="settings-search-title">Ricerca nei bugiardini</h2>
+                    <p>Regola quante informazioni recuperare per ogni domanda.</p>
+                  </div>
+                </div>
+                <div class="settings-fields">
+                  <label class="chat-control">
+                    <span>Passaggi da consultare</span>
+                    <input id="chat-top-k" type="number" min="1" max="8" step="1" value="4">
+                    <small>Numero di passaggi rilevanti da includere nella ricerca (da 1 a 8).</small>
+                  </label>
+                </div>
+              </section>
+
+              <section class="settings-section" aria-labelledby="settings-memory-title">
+                <div class="settings-section-heading">
+                  <span class="settings-section-icon" aria-hidden="true">03</span>
+                  <div>
+                    <h2 id="settings-memory-title">Memoria della conversazione</h2>
+                    <p>Definisci come mantenere il contesto tra una domanda e l’altra.</p>
+                  </div>
+                </div>
+                <div class="settings-fields">
+                  <label class="chat-control">
+                    <span>Modalità memoria</span>
+                    <select id="chat-memory">
+                      <option value="buffer" selected>Buffer · mantiene i messaggi recenti</option>
+                      <option value="summary">Riassunto · compatta il contesto precedente</option>
+                    </select>
+                  </label>
+                  <label class="chat-control">
+                    <span>Budget memoria (token)</span>
+                    <input id="chat-budget" type="number" min="150" max="4000" step="50" value="700">
+                    <small>Limite di contesto per la memoria della chat (da 150 a 4.000).</small>
+                  </label>
+                </div>
+              </section>
+
+              <section class="settings-section" aria-labelledby="settings-display-title">
+                <div class="settings-section-heading">
+                  <span class="settings-section-icon" aria-hidden="true">04</span>
+                  <div>
+                    <h2 id="settings-display-title">Dettagli della risposta</h2>
+                    <p>Scegli quali informazioni aggiuntive mostrare nella conversazione.</p>
+                  </div>
+                </div>
+                <div class="settings-fields">
+                  <label class="settings-toggle">
+                    <span class="settings-toggle-copy">
+                      <strong>Mostra ragionamento</strong>
+                      <small>Visualizza una sintesi dei criteri e delle fonti consultate, non il ragionamento interno dell’AI.</small>
+                    </span>
+                    <input id="chat-show-reasoning" type="checkbox" role="switch">
+                  </label>
+                  <label class="settings-toggle">
+                    <span class="settings-toggle-copy">
+                      <strong>Mostra costo interazione</strong>
+                      <small>Visualizza una stima in USD basata sui token comunicati dall’API; l’importo fatturato può variare.</small>
+                    </span>
+                    <input id="chat-show-interaction-cost" type="checkbox" role="switch">
+                  </label>
+                </div>
+              </section>
+
+              <div class="settings-actions">
+                <p class="settings-note">Le modifiche valgono per questa installazione locale.</p>
+                <button class="primary-button" id="save-settings" type="submit">
+                  <span aria-hidden="true">✓</span>
+                  Salva impostazioni
+                </button>
+              </div>
+            </form>
+          </section>
 
           <section class="database-view" id="database-view" hidden>
             <div class="page-heading database-heading">

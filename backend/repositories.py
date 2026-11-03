@@ -1,11 +1,133 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import date
 from typing import Any
 
 from backend.database import Database, MEDICINE_FIELDS
 from backend.errors import APIError
+
+
+class ChatSettingsRepository:
+    _metadata_key = "chat_settings"
+    _fields = {
+        "model",
+        "embedding_model",
+        "top_k",
+        "memory_mode",
+        "budget_tokens",
+        "show_reasoning",
+        "show_interaction_cost",
+    }
+
+    def __init__(self, database: Database, configuration: dict[str, Any]) -> None:
+        self.database = database
+        self.models = configuration["models"]
+        self.default_model = configuration["default_model"]
+        self.embedding_models = configuration["embedding_models"]
+        self.default_embedding_model = configuration["default_embedding_model"]
+
+    def get(self) -> dict[str, Any]:
+        with self.database.connect() as connection:
+            defaults = self._defaults()
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO app_metadata (chiave, valore)
+                VALUES (?, ?)
+                """,
+                (self._metadata_key, json.dumps(defaults)),
+            )
+            row = connection.execute(
+                "SELECT valore FROM app_metadata WHERE chiave = ?",
+                (self._metadata_key,),
+            ).fetchone()
+            try:
+                stored_settings = json.loads(row["valore"])
+            except json.JSONDecodeError as error:
+                raise APIError(
+                    500, "Le impostazioni salvate non sono leggibili."
+                ) from error
+            settings = (
+                dict(stored_settings)
+                if isinstance(stored_settings, dict)
+                else stored_settings
+            )
+            if isinstance(settings, dict):
+                settings.setdefault("embedding_model", self.default_embedding_model)
+                settings.setdefault("show_reasoning", False)
+                settings.setdefault("show_interaction_cost", False)
+            try:
+                settings = self._validate(settings)
+            except APIError as error:
+                raise APIError(
+                    500, "Le impostazioni salvate non sono valide."
+                ) from error
+            if settings != stored_settings:
+                connection.execute(
+                    "UPDATE app_metadata SET valore = ? WHERE chiave = ?",
+                    (json.dumps(settings), self._metadata_key),
+                )
+            return settings
+
+    def update(self, data: dict[str, Any]) -> dict[str, Any]:
+        settings = self._validate(data)
+        with self.database.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO app_metadata (chiave, valore) VALUES (?, ?)
+                ON CONFLICT(chiave) DO UPDATE SET valore = excluded.valore
+                """,
+                (self._metadata_key, json.dumps(settings)),
+            )
+        return settings
+
+    def _defaults(self) -> dict[str, Any]:
+        return {
+            "model": self.default_model,
+            "embedding_model": self.default_embedding_model,
+            "top_k": 4,
+            "memory_mode": "buffer",
+            "budget_tokens": 700,
+            "show_reasoning": False,
+            "show_interaction_cost": False,
+        }
+
+    def _validate(self, data: Any) -> dict[str, Any]:
+        if not isinstance(data, dict) or set(data) != self._fields:
+            raise APIError(400, "Le impostazioni della chat non sono complete.")
+        if not isinstance(data["model"], str) or data["model"] not in self.models:
+            raise APIError(400, "Modello non supportato.")
+        if (
+            not isinstance(data["embedding_model"], str)
+            or data["embedding_model"] not in self.embedding_models
+        ):
+            raise APIError(400, "Modello di ricerca non supportato.")
+        if type(data["top_k"]) is not int or not 1 <= data["top_k"] <= 8:
+            raise APIError(400, "Il numero di fonti deve essere compreso tra 1 e 8.")
+        if not isinstance(data["memory_mode"], str) or data["memory_mode"] not in {
+            "buffer",
+            "summary",
+        }:
+            raise APIError(400, "Modalità memoria non supportata.")
+        if (
+            type(data["budget_tokens"]) is not int
+            or not 150 <= data["budget_tokens"] <= 4_000
+        ):
+            raise APIError(400, "Il budget token deve essere compreso tra 150 e 4000.")
+        if type(data["show_reasoning"]) is not bool:
+            raise APIError(400, "Mostra ragionamento deve essere booleano.")
+        if type(data["show_interaction_cost"]) is not bool:
+            raise APIError(400, "Mostra costo interazione deve essere booleano.")
+        return {
+            "model": data["model"],
+            "embedding_model": data["embedding_model"],
+            "top_k": data["top_k"],
+            "memory_mode": data["memory_mode"],
+            "budget_tokens": data["budget_tokens"],
+            "show_reasoning": data["show_reasoning"],
+            "show_interaction_cost": data["show_interaction_cost"],
+        }
 
 
 class MedicineRepository:
