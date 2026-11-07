@@ -66,6 +66,23 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._send_error_json(500, "Errore durante la lettura del database.")
 
     def do_POST(self) -> None:
+        stream_started = False
+
+        def send_stream_event(event: dict[str, Any]) -> None:
+            nonlocal stream_started
+            if not stream_started:
+                self.send_response(200)
+                self.send_header(
+                    "Content-Type", "application/x-ndjson; charset=utf-8"
+                )
+                self.send_header("Cache-Control", "no-cache, no-transform")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.end_headers()
+                stream_started = True
+            content = json.dumps(event, ensure_ascii=False).encode("utf-8") + b"\n"
+            self.wfile.write(content)
+            self.wfile.flush()
+
         try:
             if urlsplit(self.path).path == "/api/medicines":
                 data, leaflet = self._read_multipart_body()
@@ -110,27 +127,59 @@ class RequestHandler(BaseHTTPRequestHandler):
                     )
             elif urlsplit(self.path).path == "/api/chat":
                 result = self.chat_service.respond(self._read_json_body())
+            elif urlsplit(self.path).path == "/api/chat/stream":
+                result = self.chat_service.respond(
+                    self._read_json_body(),
+                    on_delta=lambda delta: send_stream_event(
+                        {"type": "delta", "delta": delta}
+                    ),
+                )
+                if stream_started:
+                    send_stream_event({"type": "done", "result": result})
+                    return
             elif urlsplit(self.path).path == "/api/stock":
                 data = self._read_json_body()
                 result = StockRepository(self.database).create(data)
             else:
                 raise APIError(404, "Endpoint non trovato.")
-            status = 200 if urlsplit(self.path).path == "/api/chat" else 201
+            status = (
+                200
+                if urlsplit(self.path).path in {"/api/chat", "/api/chat/stream"}
+                else 201
+            )
             self._send_json(status, result)
         except APIError as error:
-            self._send_error_json(error.status, error.message)
+            if stream_started:
+                send_stream_event({"type": "error", "error": error.message})
+            else:
+                self._send_error_json(error.status, error.message)
         except ChatUnavailableError as error:
-            self._send_error_json(503, str(error))
+            if stream_started:
+                send_stream_event({"type": "error", "error": str(error)})
+            else:
+                self._send_error_json(503, str(error))
         except ValueError as error:
-            self._send_error_json(400, str(error))
+            if stream_started:
+                send_stream_event({"type": "error", "error": str(error)})
+            else:
+                self._send_error_json(400, str(error))
         except sqlite3.Error:
             logging.exception("Errore di scrittura nel database")
-            self._send_error_json(500, "Errore durante il salvataggio.")
+            if stream_started:
+                send_stream_event(
+                    {"type": "error", "error": "Errore durante il salvataggio."}
+                )
+            else:
+                self._send_error_json(500, "Errore durante il salvataggio.")
         except Exception:
             logging.exception("Errore durante la risposta RAG")
-            self._send_error_json(
-                502, "La chat non è riuscita. Controlla configurazione e connessione."
+            message = (
+                "La chat non è riuscita. Controlla configurazione e connessione."
             )
+            if stream_started:
+                send_stream_event({"type": "error", "error": message})
+            else:
+                self._send_error_json(502, message)
 
     def do_PUT(self) -> None:
         parsed = urlsplit(self.path)

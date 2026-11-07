@@ -1,10 +1,10 @@
 const defaultChatSettings = {
   model: "gpt-4o-mini",
   embedding_model: "text-embedding-3-small",
+  retrieval_mode: "semantic",
   top_k: 4,
   memory_mode: "buffer",
   budget_tokens: 700,
-  show_reasoning: false,
   show_interaction_cost: false,
 };
 const defaultChatModels = ["gpt-4o-mini", "gpt-4.1-mini"];
@@ -17,7 +17,7 @@ const state = {
   editing: null,
   searchTimer: null,
   toastTimer: null,
-  sessionId: localStorage.getItem("ifarmaco-chat-session") || crypto.randomUUID(),
+  sessionId: crypto.randomUUID(),
   chatHistory: [],
   chatBusy: false,
   chatConfigured: false,
@@ -92,10 +92,10 @@ const elements = {
   answerAvatar: document.querySelector(".answer-avatar"),
   chatModel: document.querySelector("#chat-model"),
   chatEmbeddingModel: document.querySelector("#chat-embedding-model"),
+  chatRetrievalMode: document.querySelector("#chat-retrieval-mode"),
   chatTopK: document.querySelector("#chat-top-k"),
   chatMemory: document.querySelector("#chat-memory"),
   chatBudget: document.querySelector("#chat-budget"),
-  chatShowReasoning: document.querySelector("#chat-show-reasoning"),
   chatShowInteractionCost: document.querySelector("#chat-show-interaction-cost"),
   settingsForm: document.querySelector("#settings-form"),
   saveSettings: document.querySelector("#save-settings"),
@@ -121,6 +121,55 @@ async function requestJSON(url, options = {}) {
     throw new Error(payload.error || `Richiesta non riuscita (${response.status}).`);
   }
   return payload;
+}
+
+async function requestChatStream(body, onDelta) {
+  const response = await fetch("/api/chat/stream", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) {
+    const payload = await response.json();
+    throw new Error(payload.error || `Richiesta non riuscita (${response.status}).`);
+  }
+  if (!response.headers.get("Content-Type")?.includes("application/x-ndjson")) {
+    return response.json();
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let result;
+  const processLine = (line) => {
+    if (!line.trim()) {
+      return;
+    }
+    const event = JSON.parse(line);
+    if (event.type === "delta") {
+      onDelta(event.delta);
+    } else if (event.type === "done") {
+      result = event.result;
+    } else if (event.type === "error") {
+      throw new Error(event.error);
+    }
+  };
+
+  while (true) {
+    const { done, value } = await reader.read();
+    buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+    const lines = buffer.split("\n");
+    buffer = lines.pop();
+    lines.forEach(processLine);
+    if (done) {
+      break;
+    }
+  }
+  processLine(buffer);
+  if (!result) {
+    throw new Error("La risposta della chat è stata interrotta.");
+  }
+  return result;
 }
 
 function showToast(message, isError = false) {
@@ -488,37 +537,39 @@ function renderChat(messages = [], pending = false) {
       link.href = source.url;
       link.target = "_blank";
       link.rel = "noopener noreferrer";
-      link.append(document.createTextNode("Bugiardino "));
-      const page = document.createElement("strong");
-      page.textContent = `pagina ${source.page}`;
-      link.append(page);
+      const copy = document.createElement("span");
+      copy.className = "source-copy";
+      const title = document.createElement("strong");
+      title.textContent = `${source.id} · pagina ${source.page}`;
+      copy.append(title);
+      if (typeof source.excerpt === "string" && source.excerpt.trim()) {
+        const excerpt = document.createElement("span");
+        excerpt.className = "source-excerpt";
+        excerpt.textContent = source.excerpt;
+        copy.append(excerpt);
+      }
+      link.append(copy);
+      const arrow = document.createElement("span");
+      arrow.className = "source-arrow";
+      arrow.setAttribute("aria-hidden", "true");
+      arrow.textContent = "↗";
+      link.append(arrow);
       content.append(link);
     });
-    const showReasoning = state.chatSettings.show_reasoning && message.reasoning;
     const showCost = state.chatSettings.show_interaction_cost
       && Number.isFinite(message.interaction_cost_usd);
-    if (showReasoning || showCost) {
+    if (showCost) {
       const details = document.createElement("div");
       details.className = "answer-details";
-      if (showReasoning) {
-        const explanation = document.createElement("p");
-        explanation.className = "answer-reasoning";
-        const label = document.createElement("strong");
-        label.textContent = "Sintesi";
-        explanation.append(label, document.createTextNode(message.reasoning));
-        details.append(explanation);
-      }
-      if (showCost) {
-        const cost = document.createElement("p");
-        cost.className = "answer-cost";
-        cost.textContent = `Costo stimato: ${new Intl.NumberFormat("it-IT", {
-          style: "currency",
-          currency: "USD",
-          minimumFractionDigits: 6,
-          maximumFractionDigits: 8,
-        }).format(message.interaction_cost_usd)} · calcolo indicativo sui token API`;
-        details.append(cost);
-      }
+      const cost = document.createElement("p");
+      cost.className = "answer-cost";
+      cost.textContent = `Costo stimato: ${new Intl.NumberFormat("it-IT", {
+        style: "currency",
+        currency: "USD",
+        minimumFractionDigits: 6,
+        maximumFractionDigits: 8,
+      }).format(message.interaction_cost_usd)} · calcolo indicativo sui token API`;
+      details.append(cost);
       content.append(details);
     }
     row.append(avatar, content);
@@ -541,7 +592,6 @@ function renderChat(messages = [], pending = false) {
 }
 
 async function initializeChat() {
-  localStorage.setItem("ifarmaco-chat-session", state.sessionId);
   try {
     const [config, settings] = await Promise.all([
       requestJSON("/api/chat/config"),
@@ -561,13 +611,22 @@ async function initializeChat() {
       option.textContent = model;
       elements.chatEmbeddingModel.append(option);
     });
+    elements.chatRetrievalMode.replaceChildren();
+    (config.retrieval_modes || ["semantic", "hybrid"]).forEach((mode) => {
+      const option = document.createElement("option");
+      option.value = mode;
+      option.textContent = mode === "hybrid"
+        ? "Ibrida · semantica + parole chiave (BM25)"
+        : "Semantica · per significato";
+      elements.chatRetrievalMode.append(option);
+    });
     state.chatSettings = { ...defaultChatSettings, ...settings };
     elements.chatModel.value = state.chatSettings.model;
     elements.chatEmbeddingModel.value = state.chatSettings.embedding_model;
+    elements.chatRetrievalMode.value = state.chatSettings.retrieval_mode;
     elements.chatTopK.value = state.chatSettings.top_k;
     elements.chatMemory.value = state.chatSettings.memory_mode;
     elements.chatBudget.value = state.chatSettings.budget_tokens;
-    elements.chatShowReasoning.checked = state.chatSettings.show_reasoning;
     elements.chatShowInteractionCost.checked = state.chatSettings.show_interaction_cost;
     elements.chatStatus.textContent = config.configured ? "Pronto ad aiutarti" : "API non configurata";
     state.chatConfigured = config.configured;
@@ -577,9 +636,8 @@ async function initializeChat() {
     if (!config.configured) {
       elements.chatSetupNotice.textContent = "Aggiungi OPENAI_API_KEY al file .env e riavvia l'applicazione per attivare la chat.";
     }
-    const saved = await requestJSON(`/api/chat/session/${encodeURIComponent(state.sessionId)}`);
-    state.chatHistory = saved.messages;
-    renderChat(state.chatHistory);
+    state.chatHistory = [];
+    renderChat();
   } catch (error) {
     elements.chatStatus.textContent = "Servizio non disponibile";
     elements.chatStatusDot.classList.add("is-offline");
@@ -607,14 +665,35 @@ async function sendChat(event) {
   elements.chatStatus.textContent = "Sto cercando nel bugiardino";
   renderChat([...state.chatHistory, { role: "user", content: message }], true);
   try {
-    const result = await requestJSON("/api/chat", {
-      method: "POST",
-      body: JSON.stringify({
+    let streamedAnswer = "";
+    let streamingAnswerElement = null;
+    const result = await requestChatStream(
+      {
         session_id: state.sessionId,
         message,
         ...state.chatSettings,
-      }),
-    });
+      },
+      (delta) => {
+        streamedAnswer += delta;
+        if (!streamingAnswerElement) {
+          renderChat(
+            [
+              ...state.chatHistory,
+              { role: "user", content: message },
+              { role: "assistant", content: streamedAnswer },
+            ],
+            true,
+          );
+          const answerParagraphs = elements.conversation.querySelectorAll(
+            ".answer-row:not(.is-pending) .answer-content > p",
+          );
+          streamingAnswerElement = answerParagraphs[answerParagraphs.length - 1];
+        } else {
+          streamingAnswerElement.textContent += delta;
+          elements.conversation.scrollTop = elements.conversation.scrollHeight;
+        }
+      },
+    );
     state.chatHistory = result.messages;
     renderChat(state.chatHistory);
     elements.chatStatus.textContent = result.searched_query !== message
@@ -639,10 +718,10 @@ async function saveChatSettings(event) {
   const settings = {
     model: elements.chatModel.value,
     embedding_model: elements.chatEmbeddingModel.value,
+    retrieval_mode: elements.chatRetrievalMode.value,
     top_k: Number(elements.chatTopK.value),
     memory_mode: elements.chatMemory.value,
     budget_tokens: Number(elements.chatBudget.value),
-    show_reasoning: elements.chatShowReasoning.checked,
     show_interaction_cost: elements.chatShowInteractionCost.checked,
   };
   elements.saveSettings.disabled = true;
@@ -664,7 +743,6 @@ async function saveChatSettings(event) {
 function startNewChat() {
   state.sessionId = crypto.randomUUID();
   state.chatHistory = [];
-  localStorage.setItem("ifarmaco-chat-session", state.sessionId);
   elements.chatStatus.textContent = "Pronto ad aiutarti";
   renderChat();
 }

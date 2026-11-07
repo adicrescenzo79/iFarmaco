@@ -433,6 +433,7 @@ h1 em {
   display: flex;
   align-items: flex-start;
   gap: 11px;
+  margin-bottom: 22px;
 }
 
 .answer-avatar {
@@ -457,11 +458,10 @@ h1 em {
 
 .source-card {
   display: flex;
-  min-height: 55px;
-  align-items: center;
-  gap: 10px;
-  margin: 14px 0 9px;
-  padding: 9px 11px;
+  align-items: flex-start;
+  gap: 12px;
+  margin: 12px 0 9px;
+  padding: 11px 13px;
   border: 1px solid #e8eee8;
   border-radius: 8px;
   background: #fbfcfa;
@@ -483,13 +483,18 @@ h1 em {
   height: 17px;
 }
 
+.source-copy {
+  display: block;
+  min-width: 0;
+}
+
 .source-copy strong,
 .source-copy small {
   display: block;
 }
 
 .source-copy strong {
-  margin-bottom: 3px;
+  margin-bottom: 5px;
   color: #53665a;
   font-size: 9px;
   font-weight: 700;
@@ -500,8 +505,16 @@ h1 em {
   font-size: 9px;
 }
 
+.source-excerpt {
+  display: block;
+  color: #66766e;
+  font-size: 10px;
+  line-height: 1.6;
+}
+
 .source-arrow {
-  margin-left: auto;
+  flex: 0 0 auto;
+  margin: 1px 0 0 auto;
   color: #8d9a90;
   font-size: 13px;
 }
@@ -1613,17 +1626,12 @@ h1 em {
   line-height: 1.55;
 }
 
-.answer-reasoning strong {
-  margin-right: 5px;
-  color: var(--ink);
-}
-
 .answer-cost {
   font-variant-numeric: tabular-nums;
 }
 
 .source-card {
-  width: fit-content;
+  width: 100%;
   color: #4f7159;
   font-size: 10px;
   text-decoration: none;

@@ -8,7 +8,7 @@ import unicodedata
 from datetime import date
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from dotenv import load_dotenv
 
@@ -22,6 +22,9 @@ load_dotenv(ROOT_DIR / ".env")
 CHAT_MODELS = ("gpt-4o-mini", "gpt-4.1-mini")
 EMBEDDING_MODELS = ("text-embedding-3-small", "text-embedding-3-large")
 DEFAULT_EMBEDDING_MODEL = EMBEDDING_MODELS[0]
+RETRIEVAL_MODES = ("semantic", "hybrid")
+DEFAULT_RETRIEVAL_MODE = "semantic"
+RRF_CONSTANT = 60
 MODEL_PRICES_USD_PER_MILLION = {
     "gpt-4o-mini": (0.15, 0.60),
     "gpt-4.1-mini": (0.40, 1.60),
@@ -41,23 +44,41 @@ cita ogni farmaco e pagina. Non formulare
 diagnosi né prescrivere, sospendere o modificare terapie; per consigli
 personali rimanda a medico o farmacista. In caso di possibile emergenza, invita
 l'utente a contattare subito i servizi di emergenza. Per domande su quantità,
-disponibilità o scorte correnti usa get_medicine_stock; non dedurre le quantità
-da memoria o dai bugiardini. Distingui pezzi scaduti e non scaduti e non
-sommare prodotti distinti senza specificarlo."""
+disponibilità o scorte correnti interroga sempre il database con
+get_medicine_stock, anche se non è indicato un farmaco: in quel caso usa
+medicine_name vuoto per leggere le giacenze di tutte le tabelle farmaci e scorte.
+Non chiedere all'utente di specificare un farmaco per una richiesta generale e
+non dedurre le quantità da memoria o dai bugiardini. Distingui pezzi scaduti e
+non scaduti e non sommare prodotti distinti senza specificarlo. Rispondi
+restando pertinente alla domanda: non aggiungere consigli generici o non
+richiesti su stile di vita, sessualità o abitudini personali e non presumere né
+commentare le abitudini dell'utente. Includi indicazioni di sicurezza solo se
+direttamente pertinenti alla domanda sul farmaco o riportate nei documenti
+consultati. Se l'utente chiede altri farmaci per lo stesso problema, sintomo o
+condizione, cerca nel corpus globale e non limitarti al farmaco citato nei
+turni precedenti. Elenca solo i prodotti per cui i documenti forniti supportano
+la pertinenza e cita ogni prodotto e pagina."""
 INVENTORY_TOOL = {
     "type": "function",
     "name": "get_medicine_stock",
     "description": (
         "Legge dal database SQLite i lotti e le quantità correnti dei farmaci. "
         "Usa questo tool quando l'utente chiede quante confezioni o pezzi ha, "
-        "la disponibilità o le scorte di uno o più farmaci. Non modifica dati."
+        "la disponibilità o le scorte di uno o più farmaci. Per richieste "
+        "generali, comparative o relative a una classe di farmaci senza un "
+        "prodotto specifico, passa una stringa vuota per leggere tutte le "
+        "giacenze e selezionare solo i prodotti pertinenti. Non modifica dati."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "medicine_name": {
                 "type": "string",
-                "description": "Nome o principio attivo del farmaco da cercare.",
+                "description": (
+                    "Nome, principio attivo o classe terapeutica. Per una "
+                    "classe (per esempio antibiotici) o una richiesta generica, "
+                    "usa la stringa vuota per leggere tutte le giacenze."
+                ),
             }
         },
         "required": ["medicine_name"],
@@ -77,13 +98,43 @@ INVENTORY_QUANTITY = re.compile(
     r"a disposizione)\b",
     re.IGNORECASE,
 )
+MEDICINE_CLASS_TERMS = re.compile(
+    r"\b(?:"
+    r"farmaci|medicinali|antibiotic[oi]|antidolorific[oi]|"
+    r"analgesic[oi]|antinfiammator[ei]|antipertensiv[oi]|"
+    r"antidepressiv[oi]|antistaminic[oi]|antiviral[ei]|"
+    r"anticoagulant[ei]|antimicotic[oi]"
+    r")\b",
+    re.IGNORECASE,
+)
+MEDICINE_OWNERSHIP_QUESTION = re.compile(
+    r"\b(?:ho|abbiamo|possiedo)\b", re.IGNORECASE
+)
 DOSAGE_FREQUENCY = re.compile(r"\b(quante?|quanti)\s+volte\b", re.IGNORECASE)
+MEDICINE_CONTEXT_REFERENCES = re.compile(
+    r"\b(?:"
+    r"lo prendo|la prendo|li prendo|le prendo|"
+    r"posso prenderlo|posso prenderla|posso assumerlo|posso assumerla|"
+    r"effetti collaterali|effetti indesiderati|interazioni|"
+    r"controindicazioni|posologia|dosaggio"
+    r")\b",
+    re.IGNORECASE,
+)
 SYMPTOM_SEARCH_TERMS = {
     "mal di testa": ("mal di testa", "cefalea"),
     "cefalea": ("cefalea", "mal di testa"),
     "emicrania": ("emicrania",),
     "headache": ("headache", "cefalea", "mal di testa"),
 }
+ALTERNATIVE_MEDICINE_FOLLOW_UP = re.compile(
+    r"\b(?:"
+    r"(?:ce ne sono|ce ne siano|ci sono|ne esistono)\s+altr[oi]|"
+    r"a parte|oltre|escludendo|qualcos altro|"
+    r"altr[oi]\s+(?:farmaci?|medicinali?|prodotti)|"
+    r"divers[oi]\s+(?:farmaci?|medicinali?|prodotti)"
+    r")\b",
+    re.IGNORECASE,
+)
 
 
 class ChatUnavailableError(Exception):
@@ -105,6 +156,9 @@ class ChatService:
         self._client: Any = None
         self._vector_client: Any = None
         self._collections: dict[str, Any] = {}
+        self._bm25_indices: dict[
+            str, tuple[int, list[str], list[str], list[dict[str, Any]], Any]
+        ] = {}
 
     @staticmethod
     def configuration() -> dict[str, Any]:
@@ -114,6 +168,8 @@ class ChatService:
             "default_model": CHAT_MODELS[0],
             "embedding_models": list(EMBEDDING_MODELS),
             "default_embedding_model": DEFAULT_EMBEDDING_MODEL,
+            "retrieval_modes": list(RETRIEVAL_MODES),
+            "default_retrieval_mode": DEFAULT_RETRIEVAL_MODE,
         }
 
     @staticmethod
@@ -179,13 +235,9 @@ class ChatService:
     def _response_details(
         self,
         *,
-        show_reasoning: bool,
-        reasoning: str,
         usage_records: list[dict[str, Any]] | None,
     ) -> dict[str, Any]:
         details: dict[str, Any] = {}
-        if show_reasoning and reasoning:
-            details["reasoning"] = reasoning
         if usage_records is not None:
             cost = self._estimate_interaction_cost(usage_records)
             if cost is not None:
@@ -221,7 +273,11 @@ class ChatService:
             ],
         }
 
-    def respond(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def respond(
+        self,
+        payload: dict[str, Any],
+        on_delta: Callable[[str], None] | None = None,
+    ) -> dict[str, Any]:
         configuration = self.configuration()
         if not configuration["configured"]:
             raise ChatUnavailableError("Configura OPENAI_API_KEY nel file .env.")
@@ -237,15 +293,37 @@ class ChatService:
 
         selected_id = payload.get("medicine_id")
         mentioned = self._find_mentioned_medicines(message)
-        if mentioned:
+        broad_search_follow_up = self._is_broad_medicine_follow_up(
+            message, saved["messages"]
+        )
+        contextual_follow_up = broad_search_follow_up or bool(
+            MEDICINE_CONTEXT_REFERENCES.search(message)
+        )
+        if broad_search_follow_up:
+            medicines = []
+        elif mentioned:
             medicines = mentioned
         elif isinstance(selected_id, str) and selected_id:
             medicines = [MedicineRepository(self.database).get(selected_id)]
+        elif contextual_follow_up:
+            previous_answer = next(
+                (
+                    item["content"]
+                    for item in reversed(saved["messages"])
+                    if item["role"] == "assistant"
+                ),
+                "",
+            )
+            previous_mentions = self._find_mentioned_medicines(previous_answer)
+            if len(previous_mentions) == 1:
+                medicines = previous_mentions
+            else:
+                medicines = [
+                    MedicineRepository(self.database).get(medicine_id)
+                    for medicine_id in saved["medicine_ids"]
+                ]
         else:
-            medicines = [
-                MedicineRepository(self.database).get(medicine_id)
-                for medicine_id in saved["medicine_ids"]
-            ]
+            medicines = []
         model = payload.get("model", configuration["default_model"])
         if not isinstance(model, str) or model not in CHAT_MODELS:
             raise ValueError("Modello non supportato.")
@@ -257,9 +335,11 @@ class ChatService:
             or embedding_model not in EMBEDDING_MODELS
         ):
             raise ValueError("Modello di ricerca non supportato.")
-        show_reasoning = payload.get("show_reasoning", False)
+        retrieval_mode = payload.get("retrieval_mode", DEFAULT_RETRIEVAL_MODE)
+        if retrieval_mode not in RETRIEVAL_MODES:
+            raise ValueError("Modalità di ricerca non supportata.")
         show_interaction_cost = payload.get("show_interaction_cost", False)
-        if type(show_reasoning) is not bool or type(show_interaction_cost) is not bool:
+        if type(show_interaction_cost) is not bool:
             raise ValueError("Le preferenze di visualizzazione devono essere booleane.")
         usage_records = [] if show_interaction_cost else None
         try:
@@ -274,7 +354,10 @@ class ChatService:
             raise ValueError("Modalità memoria non supportata.")
 
         history = saved["messages"][-100:]
-        inventory_question = self._is_inventory_question(message)
+        context_history = history.copy() if contextual_follow_up else []
+        inventory_question = self._is_inventory_question(
+            message, medicine_mentioned=bool(mentioned)
+        )
         if EXPIRY_QUESTION.search(message):
             expiry_medicines = mentioned or MedicineRepository(self.database).list()
             expired = self._expired_stock(expiry_medicines)
@@ -298,11 +381,6 @@ class ChatService:
             }
             assistant_message.update(
                 self._response_details(
-                    show_reasoning=show_reasoning,
-                    reasoning=(
-                        "Ho controllato le date di scadenza dei lotti registrati "
-                        "nel database locale."
-                    ),
                     usage_records=usage_records,
                 )
             )
@@ -328,7 +406,12 @@ class ChatService:
         has_supported_symptom = any(
             f" {symptom} " in padded_message for symptom in SYMPTOM_SEARCH_TERMS
         )
-        if not medicines and not inventory_question and has_supported_symptom:
+        if (
+            not medicines
+            and not inventory_question
+            and not contextual_follow_up
+            and has_supported_symptom
+        ):
             symptom_search = self._search_available_leaflets(message)
             if symptom_search is not None:
                 matches = symptom_search["matches"]
@@ -365,6 +448,7 @@ class ChatService:
                         "medicine_id": match["medicine_id"],
                         "page": match["page"],
                         "score": 1.0,
+                        "excerpt": match["excerpt"],
                         "url": (
                             f"/api/medicines/{match['medicine_id']}/leaflet"
                             f"#page={match['page']}"
@@ -380,13 +464,6 @@ class ChatService:
                 }
                 assistant_message.update(
                     self._response_details(
-                        show_reasoning=show_reasoning,
-                        reasoning=(
-                            "Ho cercato riferimenti nelle sezioni delle indicazioni "
-                            "dei bugiardini disponibili. Le pagine collegate mostrano "
-                            "i passaggi usati; il confronto non indica quale farmaco "
-                            "sia adatto alla persona."
-                        ),
                         usage_records=usage_records,
                     )
                 )
@@ -420,12 +497,6 @@ class ChatService:
                         "role": "assistant",
                         "content": answer,
                         **self._response_details(
-                            show_reasoning=show_reasoning,
-                            reasoning=(
-                                "Non ho identificato con certezza il farmaco nella "
-                                "domanda o nella conversazione. Chiedo un chiarimento "
-                                "prima di consultare un bugiardino."
-                            ),
                             usage_records=usage_records,
                         ),
                         "sources": [],
@@ -445,40 +516,49 @@ class ChatService:
                 "messages": history,
                 "needs_clarification": True,
             }
-        if len(medicines) > 4:
-            raise ValueError("Per volta puoi confrontare al massimo quattro farmaci.")
-
         client = self._openai_client()
         if inventory_question:
             answer, inventory_results = self._answer_inventory(
                 client,
                 model,
-                history,
+                context_history,
                 message,
                 [medicine["nome"] for medicine in medicines],
                 usage_records=usage_records,
+                on_delta=on_delta,
             )
-            medicine_ids = list(
+            result_medicine_ids = list(
                 dict.fromkeys(
                     match["medicine_id"]
                     for result in inventory_results
                     for match in result.get("matches", [])
                 )
             )
+            if mentioned:
+                medicine_ids = [medicine["id"] for medicine in mentioned]
+            elif medicines:
+                medicine_ids = [medicine["id"] for medicine in medicines]
+            elif any(result.get("query") for result in inventory_results):
+                medicine_ids = result_medicine_ids
+            else:
+                answer_medicines = self._find_mentioned_medicines(answer)
+                if answer_medicines:
+                    medicine_ids = [
+                        medicine["id"] for medicine in answer_medicines
+                    ]
+                else:
+                    medicine_ids = [
+                        match["medicine_id"]
+                        for result in inventory_results
+                        if "query" not in result
+                        for match in result.get("matches", [])
+                    ]
             medicine_names = [
                 MedicineRepository(self.database).get(medicine_id)["nome"]
                 for medicine_id in medicine_ids
             ]
             searched_query = message
             chunks = []
-            reasoning = (
-                "Ho verificato le giacenze nel database locale"
-                + (
-                    f" per {', '.join(medicine_names)}."
-                    if medicine_names
-                    else " per i farmaci individuati nella domanda."
-                )
-            )
         else:
             medicine_names = [medicine["nome"] for medicine in medicines]
             search_scope = ", ".join(medicine_names) or "tutti i bugiardini indicizzati"
@@ -490,7 +570,7 @@ class ChatService:
             searched_query = self._condense(
                 client,
                 model,
-                history,
+                context_history,
                 message,
                 search_scope,
                 **condense_arguments,
@@ -506,8 +586,49 @@ class ChatService:
                             top_k,
                             embedding_model,
                             usage_records=usage_records,
+                            search_mode=retrieval_mode,
                         )
                     )
+            elif broad_search_follow_up:
+                previous_assistant = next(
+                    (
+                        item
+                        for item in reversed(history)
+                        if item["role"] == "assistant"
+                    ),
+                    {},
+                )
+                excluded_medicine_ids = {
+                    source["medicine_id"]
+                    for source in previous_assistant.get("sources", [])
+                    if isinstance(source, dict) and source.get("medicine_id")
+                }
+                excluded_medicine_ids.update(
+                    medicine["id"]
+                    for medicine in mentioned
+                )
+                excluded_medicine_ids.update(
+                    medicine["id"]
+                    for medicine in self._find_mentioned_medicines(
+                        previous_assistant.get("content", "")
+                    )
+                )
+                in_stock_medicine_ids = {
+                    item["medicine_id"]
+                    for item in StockRepository(self.database).inventory_summary()
+                    if item["pezzi_non_scaduti"] > 0
+                }
+                chunks = self._retrieve_all(
+                    client,
+                    searched_query,
+                    top_k,
+                    embedding_model,
+                    usage_records=usage_records,
+                    diversify_by_medicine=True,
+                    eligible_medicine_ids=in_stock_medicine_ids,
+                    excluded_medicine_ids=excluded_medicine_ids,
+                    search_mode=retrieval_mode,
+                )
             else:
                 chunks = self._retrieve_all(
                     client,
@@ -515,6 +636,7 @@ class ChatService:
                     top_k,
                     embedding_model,
                     usage_records=usage_records,
+                    search_mode=retrieval_mode,
                 )
             chunks.sort(key=lambda chunk: chunk["score"], reverse=True)
             chunks = chunks[:top_k]
@@ -524,34 +646,27 @@ class ChatService:
                     model,
                     chunks,
                     searched_query,
-                    history,
+                    context_history,
                     usage_records=usage_records,
+                    on_delta=on_delta,
                 )
                 if chunks
                 else "Non trovo informazioni pertinenti nei bugiardini indicizzati."
             )
             if medicines:
                 medicine_ids = [medicine["id"] for medicine in medicines]
-                reasoning = (
-                    f"Ho cercato “{searched_query}” nel bugiardino di "
-                    f"{', '.join(medicine_names)} e ho selezionato {len(chunks)} "
-                    "passaggi per pertinenza. Puoi verificare le pagine nelle fonti."
-                )
             else:
                 medicine_ids = list(
                     dict.fromkeys(chunk["medicine_id"] for chunk in chunks)
                 )
                 medicine_names = list(dict.fromkeys(chunk["id"] for chunk in chunks))
-                reasoning = (
-                    f"Ho cercato “{searched_query}” in tutti i bugiardini indicizzati "
-                    f"e selezionato {len(chunks)} passaggi per pertinenza."
-                )
         sources = [
             {
                 "id": chunk["id"],
                 "medicine_id": chunk["medicine_id"],
                 "page": chunk["page"],
                 "score": round(chunk["score"], 3),
+                "excerpt": self._source_excerpt(chunk["text"]),
                 "url": f"/api/medicines/{chunk['medicine_id']}/leaflet#page={chunk['page']}",
             }
             for chunk in chunks
@@ -563,8 +678,6 @@ class ChatService:
         }
         assistant_message.update(
             self._response_details(
-                show_reasoning=show_reasoning,
-                reasoning=reasoning,
                 usage_records=None,
             )
         )
@@ -602,6 +715,7 @@ class ChatService:
         message: str,
         selected_medicines: list[str],
         usage_records: list[dict[str, Any]] | None = None,
+        on_delta: Callable[[str], None] | None = None,
     ) -> tuple[str, list[dict[str, Any]]]:
         medicine_context = (
             ", ".join(selected_medicines) if selected_medicines else "nessuno selezionato"
@@ -622,12 +736,14 @@ class ChatService:
         results: list[dict[str, Any]] = []
 
         for _ in range(3):
-            response = client.responses.create(
+            response, streamed_text = ChatService._create_streamed_response(
+                client,
                 model=model,
                 instructions=INSTRUCTIONS,
                 input=inputs,
                 tools=[INVENTORY_TOOL],
-                tool_choice="auto",
+                tool_choice="required",
+                on_delta=on_delta,
             )
             self._record_usage(usage_records, model, response)
             calls = [
@@ -636,7 +752,7 @@ class ChatService:
                 if getattr(item, "type", "") == "function_call"
             ]
             if not calls:
-                return response.output_text.strip(), results
+                return (streamed_text or response.output_text).strip(), results
 
             for call in calls:
                 if call.name != "get_medicine_stock":
@@ -667,23 +783,37 @@ class ChatService:
                     }
                 )
 
-        response = client.responses.create(
+        response, streamed_text = ChatService._create_streamed_response(
+            client,
             model=model,
             instructions=INSTRUCTIONS,
             input=inputs,
             tools=[INVENTORY_TOOL],
             tool_choice="none",
+            on_delta=on_delta,
         )
         self._record_usage(usage_records, model, response)
-        return response.output_text.strip(), results
+        return (streamed_text or response.output_text).strip(), results
 
     def _execute_inventory_tool(self, arguments: dict[str, Any]) -> dict[str, Any]:
         medicine_name = arguments.get("medicine_name")
-        if not isinstance(medicine_name, str) or not medicine_name.strip():
-            return {"error": "medicine_name è obbligatorio."}
+        if not isinstance(medicine_name, str):
+            return {"error": "medicine_name deve essere una stringa."}
         medicine_name = medicine_name.strip()[:120]
+        if not medicine_name:
+            return {
+                "query": "",
+                "matches": StockRepository(self.database).inventory_summary(),
+            }
         medicines = self._match_inventory_medicines(medicine_name)
         if not medicines:
+            if MEDICINE_CLASS_TERMS.search(
+                self._normalize_medicine_name(medicine_name)
+            ):
+                return {
+                    "query": "",
+                    "matches": StockRepository(self.database).inventory_summary(),
+                }
             return {"query": medicine_name, "matches": []}
 
         stock = StockRepository(self.database)
@@ -770,13 +900,45 @@ class ChatService:
         ]
 
     @staticmethod
-    def _is_inventory_question(message: str) -> bool:
+    def _is_inventory_question(
+        message: str, *, medicine_mentioned: bool = False
+    ) -> bool:
         if INVENTORY_TERMS.search(message):
+            return True
+        if (
+            MEDICINE_OWNERSHIP_QUESTION.search(message)
+            and (
+                MEDICINE_CLASS_TERMS.search(message)
+                or medicine_mentioned
+            )
+        ):
             return True
         return bool(
             INVENTORY_QUANTITY.search(message)
             and not DOSAGE_FREQUENCY.search(message)
         )
+
+    def _is_broad_medicine_follow_up(
+        self, message: str, history: list[dict[str, Any]]
+    ) -> bool:
+        normalized_message = self._normalize_medicine_name(message)
+        if not ALTERNATIVE_MEDICINE_FOLLOW_UP.search(normalized_message):
+            return False
+
+        previous_assistant = next(
+            (
+                item
+                for item in reversed(history[-8:])
+                if item.get("role") == "assistant"
+            ),
+            {},
+        )
+        content = previous_assistant.get("content", "")
+        has_named_medicine = (
+            isinstance(content, str)
+            and bool(self._find_mentioned_medicines(content))
+        )
+        return bool(previous_assistant.get("sources")) or has_named_medicine
 
     def _search_available_leaflets(self, message: str) -> dict[str, Any] | None:
         normalized_message = self._normalize_medicine_name(message)
@@ -792,28 +954,39 @@ class ChatService:
         if symptom is None:
             return None
 
+        result = self._search_stocked_medicines_by_indication(
+            SYMPTOM_SEARCH_TERMS[symptom]
+        )
+        result["symptom"] = symptom
+        return result
+
+    def _search_stocked_medicines_by_indication(
+        self,
+        search_terms: tuple[str, ...],
+    ) -> dict[str, Any]:
         from pypdf import PdfReader
 
-        search_terms = SYMPTOM_SEARCH_TERMS[symptom]
-        stock = StockRepository(self.database)
         matches = []
         missing_pdfs = 0
         unrecognized_sections = 0
-        for medicine in MedicineRepository(self.database).list():
-            lots = stock.for_medicine(medicine["id"])
-            available_pieces = sum(
-                lot["nr_pezzi"] for lot in lots if lot["non_scaduto"]
-            )
-            if available_pieces <= 0:
+        for inventory in StockRepository(self.database).inventory_summary():
+            medicine_id = inventory["medicine_id"]
+            if (
+                inventory["pezzi_totali"] <= 0
+                or inventory["pezzi_non_scaduti"] <= 0
+            ):
                 continue
 
-            path = self.leaflet_store.find(medicine["id"])
+            path = self.leaflet_store.find(medicine_id)
             if path is None:
                 missing_pdfs += 1
                 continue
-            page_texts = [
-                self._normalize_medicine_name(page.extract_text() or "")
+            raw_page_texts = [
+                " ".join((page.extract_text() or "").split())
                 for page in PdfReader(str(path)).pages
+            ]
+            page_texts = [
+                self._normalize_medicine_name(text) for text in raw_page_texts
             ]
             section = self._indication_section(page_texts)
             if section is None:
@@ -828,7 +1001,7 @@ class ChatService:
             if not term_matches:
                 continue
 
-            term_offset, _ = min(term_matches)
+            term_offset, matched_term = min(term_matches)
             absolute_offset = section_start + term_offset
             page_number = 1
             page_offset = 0
@@ -837,22 +1010,55 @@ class ChatService:
                     page_number = index
                     break
                 page_offset += len(page_text) + 1
+            excerpt = self._source_excerpt(
+                raw_page_texts[page_number - 1], matched_term=matched_term
+            )
             matches.append(
                 {
-                    "medicine_id": medicine["id"],
-                    "name": medicine["nome"],
-                    "pezzi_non_scaduti": available_pieces,
+                    "medicine_id": medicine_id,
+                    "name": inventory["name"],
+                    "pezzi_non_scaduti": inventory["pezzi_non_scaduti"],
+                    "pezzi_scaduti": inventory["pezzi_scaduti"],
                     "page": page_number,
+                    "excerpt": excerpt,
                 }
             )
 
         return {
-            "symptom": symptom,
             "matches": matches,
             "missing_pdfs": missing_pdfs,
             "unrecognized_sections": unrecognized_sections,
             "unavailable": missing_pdfs + unrecognized_sections,
         }
+
+    @staticmethod
+    def _source_excerpt(
+        text: str, max_length: int = 320, matched_term: str | None = None
+    ) -> str:
+        normalized = " ".join(text.split())
+        if len(normalized) <= max_length:
+            return normalized
+        if max_length <= 2:
+            return normalized[:max_length]
+
+        match = (
+            re.search(re.escape(matched_term), normalized, re.IGNORECASE)
+            if matched_term
+            else None
+        )
+        content_length = max_length - 2
+        start = max(0, match.start() - content_length // 3) if match else 0
+        end = min(len(normalized), start + content_length)
+        if end < len(normalized):
+            boundary = normalized.rfind(" ", start, end)
+            if boundary > start:
+                end = boundary
+        excerpt = normalized[start:end].strip()
+        if start:
+            excerpt = f"…{excerpt}"
+        if end < len(normalized):
+            excerpt = f"{excerpt}…"
+        return excerpt
 
     @staticmethod
     def _indication_section(page_texts: list[str]) -> tuple[str, int] | None:
@@ -866,7 +1072,8 @@ class ChatService:
         sections = []
         for start in headings:
             end = re.search(
-                r"\b2\s+(?:cosa deve sapere|cosa deve fare|prima di prendere)\b",
+                r"\b2\s+(?:che\s+)?(?:cosa deve sapere|cosa deve fare|"
+                r"prima di prendere)\b",
                 full_text[start:],
             )
             if end:
@@ -908,11 +1115,7 @@ class ChatService:
                 self._vector_client = chromadb.PersistentClient(
                     path=str(self.chroma_dir)
                 )
-            collection_name = (
-                "ifarmaco_leaflets"
-                if embedding_model == DEFAULT_EMBEDDING_MODEL
-                else f"ifarmaco_leaflets_{embedding_model.replace('-', '_')}"
-            )
+            collection_name = f"ifarmaco_leaflets_{embedding_model.replace('-', '_')}"
             collection = self._vector_client.get_or_create_collection(
                 collection_name, metadata={"hnsw:space": "cosine"}
             )
@@ -1027,6 +1230,7 @@ class ChatService:
                     for item in batch
                 ],
             )
+        self._bm25_indices.pop(embedding_model, None)
         return where, True
 
     def _retrieve(
@@ -1037,6 +1241,8 @@ class ChatService:
         top_k: int,
         embedding_model: str = DEFAULT_EMBEDDING_MODEL,
         usage_records: list[dict[str, Any]] | None = None,
+        *,
+        search_mode: str = DEFAULT_RETRIEVAL_MODE,
     ) -> list[dict[str, Any]]:
         where, _ = self._ensure_medicine_indexed(
             client, medicine, embedding_model, usage_records
@@ -1048,6 +1254,15 @@ class ChatService:
         self._record_usage(
             usage_records, embedding_model, query_embedding, embeddings=True
         )
+        if search_mode == "hybrid":
+            return self._retrieve_hybrid(
+                collection,
+                query,
+                query_embedding.data[0].embedding,
+                top_k,
+                embedding_model,
+                where=where,
+            )
         result = collection.query(
             query_embeddings=[query_embedding.data[0].embedding],
             n_results=top_k,
@@ -1064,6 +1279,177 @@ class ChatService:
             for index in range(len(result["ids"][0]))
         ]
 
+    @staticmethod
+    def _tokenize_for_bm25(text: str) -> list[str]:
+        return re.findall(r"\w+", text.casefold())
+
+    def _bm25_index(
+        self, collection: Any, embedding_model: str
+    ) -> tuple[list[str], list[str], list[dict[str, Any]], Any]:
+        count = collection.count()
+        cached = self._bm25_indices.get(embedding_model)
+        if cached is not None and cached[0] == count:
+            return cached[1], cached[2], cached[3], cached[4]
+
+        from rank_bm25 import BM25Okapi
+
+        indexed = collection.get(include=["documents", "metadatas"])
+        ids = indexed["ids"]
+        documents = indexed["documents"]
+        metadatas = indexed["metadatas"]
+        bm25 = BM25Okapi(
+            [self._tokenize_for_bm25(document or "") for document in documents]
+        )
+        self._bm25_indices[embedding_model] = (
+            count,
+            ids,
+            documents,
+            metadatas,
+            bm25,
+        )
+        return ids, documents, metadatas, bm25
+
+    @staticmethod
+    def _matches_chroma_where(
+        metadata: dict[str, Any], where: dict[str, Any] | None
+    ) -> bool:
+        if not where:
+            return True
+        if "$and" in where:
+            return all(
+                ChatService._matches_chroma_where(metadata, clause)
+                for clause in where["$and"]
+            )
+        if "$or" in where:
+            return any(
+                ChatService._matches_chroma_where(metadata, clause)
+                for clause in where["$or"]
+            )
+        for key, expected in where.items():
+            if isinstance(expected, dict) and "$eq" in expected:
+                expected = expected["$eq"]
+            if metadata.get(key) != expected:
+                return False
+        return True
+
+    def _retrieve_hybrid(
+        self,
+        collection: Any,
+        query: str,
+        query_embedding: list[float],
+        top_k: int,
+        embedding_model: str,
+        *,
+        where: dict[str, Any] | None = None,
+        diversify_by_medicine: bool = False,
+        eligible_medicine_ids: set[str] | None = None,
+        excluded_medicine_ids: set[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        ids, documents, metadatas, bm25 = self._bm25_index(
+            collection, embedding_model
+        )
+        if not ids:
+            return []
+
+        candidate_count = min(
+            len(ids),
+            max(20, top_k * 20 if diversify_by_medicine else top_k * 5),
+        )
+        query_arguments: dict[str, Any] = {
+            "query_embeddings": [query_embedding],
+            "n_results": candidate_count,
+        }
+        if where:
+            query_arguments["where"] = where
+        semantic = collection.query(**query_arguments)
+
+        medicine_names = {
+            medicine["id"]: medicine["nome"]
+            for medicine in MedicineRepository(self.database).list()
+        }
+
+        def is_allowed(metadata: dict[str, Any]) -> bool:
+            medicine_id = metadata.get("medicine_id", "")
+            return (
+                self._matches_chroma_where(metadata, where)
+                and (
+                    eligible_medicine_ids is None
+                    or medicine_id in eligible_medicine_ids
+                )
+                and (
+                    excluded_medicine_ids is None
+                    or medicine_id not in excluded_medicine_ids
+                )
+            )
+
+        semantic_results = []
+        for index, chunk_id in enumerate(semantic["ids"][0]):
+            metadata = semantic["metadatas"][0][index]
+            if not is_allowed(metadata):
+                continue
+            medicine_id = metadata["medicine_id"]
+            semantic_results.append(
+                {
+                    "chunk_id": chunk_id,
+                    "id": medicine_names.get(medicine_id, medicine_id),
+                    "medicine_id": medicine_id,
+                    "text": semantic["documents"][0][index],
+                    "page": metadata["page"],
+                    "score": 1 - semantic["distances"][0][index],
+                }
+            )
+
+        bm25_scores = bm25.get_scores(self._tokenize_for_bm25(query))
+        bm25_order = sorted(
+            (
+                index
+                for index, score in enumerate(bm25_scores)
+                if score > 0 and is_allowed(metadatas[index])
+            ),
+            key=lambda index: bm25_scores[index],
+            reverse=True,
+        )[:candidate_count]
+        bm25_results = []
+        for index in bm25_order:
+            metadata = metadatas[index]
+            medicine_id = metadata["medicine_id"]
+            bm25_results.append(
+                {
+                    "chunk_id": ids[index],
+                    "id": medicine_names.get(medicine_id, medicine_id),
+                    "medicine_id": medicine_id,
+                    "text": documents[index],
+                    "page": metadata["page"],
+                    "score": float(bm25_scores[index]),
+                }
+            )
+
+        fused: dict[str, tuple[float, dict[str, Any]]] = {}
+        for ranked_list in (semantic_results, bm25_results):
+            for rank, chunk in enumerate(ranked_list, start=1):
+                chunk_id = chunk["chunk_id"]
+                contribution = 1 / (RRF_CONSTANT + rank)
+                if chunk_id in fused:
+                    score, original = fused[chunk_id]
+                    fused[chunk_id] = (score + contribution, original)
+                else:
+                    fused[chunk_id] = (contribution, chunk)
+
+        ordered = sorted(
+            fused.values(), key=lambda item: item[0], reverse=True
+        )
+        results = []
+        seen_medicine_ids = set()
+        for score, chunk in ordered:
+            medicine_id = chunk["medicine_id"]
+            if diversify_by_medicine and medicine_id in seen_medicine_ids:
+                continue
+            seen_medicine_ids.add(medicine_id)
+            results.append({**chunk, "score": score})
+            if len(results) == top_k:
+                break
+        return results
+
     def _retrieve_all(
         self,
         client: Any,
@@ -1071,6 +1457,11 @@ class ChatService:
         top_k: int,
         embedding_model: str = DEFAULT_EMBEDDING_MODEL,
         usage_records: list[dict[str, Any]] | None = None,
+        *,
+        diversify_by_medicine: bool = False,
+        eligible_medicine_ids: set[str] | None = None,
+        excluded_medicine_ids: set[str] | None = None,
+        search_mode: str = DEFAULT_RETRIEVAL_MODE,
     ) -> list[dict[str, Any]]:
         collection = self._vector_collection(embedding_model)
         count = collection.count()
@@ -1083,27 +1474,53 @@ class ChatService:
         self._record_usage(
             usage_records, embedding_model, query_embedding, embeddings=True
         )
+        if search_mode == "hybrid":
+            return self._retrieve_hybrid(
+                collection,
+                query,
+                query_embedding.data[0].embedding,
+                top_k,
+                embedding_model,
+                diversify_by_medicine=diversify_by_medicine,
+                eligible_medicine_ids=eligible_medicine_ids,
+                excluded_medicine_ids=excluded_medicine_ids,
+            )
         result = collection.query(
             query_embeddings=[query_embedding.data[0].embedding],
-            n_results=min(top_k, count),
+            n_results=count if diversify_by_medicine else min(top_k, count),
         )
         medicine_names = {
             medicine["id"]: medicine["nome"]
             for medicine in MedicineRepository(self.database).list()
         }
-        return [
-            {
-                "id": medicine_names.get(
-                    result["metadatas"][0][index]["medicine_id"],
-                    result["metadatas"][0][index]["medicine_id"],
-                ),
-                "medicine_id": result["metadatas"][0][index]["medicine_id"],
-                "text": result["documents"][0][index],
-                "page": result["metadatas"][0][index]["page"],
-                "score": 1 - result["distances"][0][index],
-            }
-            for index in range(len(result["ids"][0]))
-        ]
+        chunks = []
+        seen_medicine_ids = set()
+        for index in range(len(result["ids"][0])):
+            metadata = result["metadatas"][0][index]
+            medicine_id = metadata["medicine_id"]
+            if (
+                eligible_medicine_ids is not None
+                and medicine_id not in eligible_medicine_ids
+            ) or (
+                excluded_medicine_ids is not None
+                and medicine_id in excluded_medicine_ids
+            ):
+                continue
+            if diversify_by_medicine and medicine_id in seen_medicine_ids:
+                continue
+            seen_medicine_ids.add(medicine_id)
+            chunks.append(
+                {
+                    "id": medicine_names.get(medicine_id, medicine_id),
+                    "medicine_id": medicine_id,
+                    "text": result["documents"][0][index],
+                    "page": metadata["page"],
+                    "score": 1 - result["distances"][0][index],
+                }
+            )
+            if len(chunks) == top_k:
+                break
+        return chunks
 
     def _find_mentioned_medicines(self, message: str) -> list[dict[str, Any]]:
         normalized_message = self._normalize_medicine_name(message)
@@ -1187,6 +1604,7 @@ class ChatService:
         question: str,
         history: list[dict[str, str]],
         usage_records: list[dict[str, Any]] | None = None,
+        on_delta: Callable[[str], None] | None = None,
     ) -> str:
         documents = "\n\n".join(
             f"<documento farmaco=\"{chunk['id']}\" pagina=\"{chunk['page']}\">\n"
@@ -1194,17 +1612,46 @@ class ChatService:
             for chunk in chunks
         )
         prompt = f"<documenti>\n{documents}\n</documenti>\n\n<domanda>\n{question}\n</domanda>"
-        result = client.responses.create(
-            model=model,
-            instructions=INSTRUCTIONS,
-            input=[
+        arguments = {
+            "model": model,
+            "instructions": INSTRUCTIONS,
+            "input": [
                 {"role": item["role"], "content": item["content"]}
                 for item in history
             ]
             + [{"role": "user", "content": prompt}],
+        }
+        result, streamed_text = ChatService._create_streamed_response(
+            client, on_delta=on_delta, **arguments
         )
         ChatService._record_usage(usage_records, model, result)
-        return result.output_text.strip()
+        return (streamed_text or result.output_text).strip()
+
+    @staticmethod
+    def _create_streamed_response(
+        client: Any,
+        *,
+        on_delta: Callable[[str], None] | None,
+        **arguments: Any,
+    ) -> tuple[Any, str]:
+        if on_delta is None:
+            return client.responses.create(**arguments), ""
+
+        stream = client.responses.create(**arguments, stream=True)
+        text_parts = []
+        completed_response = None
+        for event in stream:
+            event_type = getattr(event, "type", "")
+            if event_type == "response.output_text.delta":
+                delta = getattr(event, "delta", "")
+                if delta:
+                    text_parts.append(delta)
+                    on_delta(delta)
+            elif event_type == "response.completed":
+                completed_response = event.response
+        if completed_response is None:
+            raise RuntimeError("La generazione della risposta non è stata completata.")
+        return completed_response, "".join(text_parts)
 
     def _summarize_if_needed(
         self,

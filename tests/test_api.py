@@ -6,6 +6,7 @@ import unittest
 from io import BytesIO
 from http.client import HTTPConnection
 from pathlib import Path
+from typing import Callable
 from unittest.mock import patch
 from pypdf import PdfWriter
 from urllib.error import HTTPError, URLError
@@ -223,15 +224,56 @@ class APITests(unittest.TestCase):
         self.assertEqual(status, 503)
         self.assertIn("OPENAI_API_KEY", payload["error"])
 
+    def test_chat_stream_endpoint_sends_deltas_and_final_result(self) -> None:
+        def respond(
+            payload: dict[str, object], on_delta: Callable[[str], None]
+        ) -> dict[str, object]:
+            on_delta("Risposta ")
+            on_delta("progressiva.")
+            return {"answer": "Risposta progressiva.", "messages": []}
+
+        with patch.object(
+            self.server.RequestHandlerClass.chat_service,
+            "respond",
+            side_effect=respond,
+        ):
+            connection = HTTPConnection(
+                "127.0.0.1", self.server.server_port, timeout=3
+            )
+            body = json.dumps({"message": "Domanda"}).encode("utf-8")
+            connection.request(
+                "POST",
+                "/api/chat/stream",
+                body=body,
+                headers={"Content-Type": "application/json"},
+            )
+            response = connection.getresponse()
+            content_type = response.getheader("Content-Type")
+            events = [
+                json.loads(line)
+                for line in response.read().decode("utf-8").splitlines()
+            ]
+            connection.close()
+
+        self.assertEqual(response.status, 200)
+        self.assertIn("application/x-ndjson", content_type)
+        self.assertEqual(
+            [event["delta"] for event in events if event["type"] == "delta"],
+            ["Risposta ", "progressiva."],
+        )
+        self.assertEqual(events[-1]["type"], "done")
+        self.assertEqual(events[-1]["result"]["answer"], "Risposta progressiva.")
+
     def test_chat_settings_are_saved_and_validated(self) -> None:
         status, settings = self.request("GET", "/api/chat/settings")
         self.assertEqual(status, 200)
         self.assertEqual(settings["model"], "gpt-4o-mini")
         self.assertEqual(settings["embedding_model"], "text-embedding-3-small")
+        self.assertEqual(settings["retrieval_mode"], "semantic")
         self.assertEqual(settings["top_k"], 4)
         self.assertEqual(settings["memory_mode"], "buffer")
         self.assertEqual(settings["budget_tokens"], 700)
-        self.assertFalse(settings["show_reasoning"])
+        self.assertNotIn("show_reasoning", settings)
         self.assertFalse(settings["show_interaction_cost"])
         with self.server.RequestHandlerClass.database.connect() as connection:
             row = connection.execute(
@@ -242,10 +284,10 @@ class APITests(unittest.TestCase):
         updated = {
             "model": "gpt-4.1-mini",
             "embedding_model": "text-embedding-3-large",
+            "retrieval_mode": "hybrid",
             "top_k": 6,
             "memory_mode": "summary",
             "budget_tokens": 1_200,
-            "show_reasoning": True,
             "show_interaction_cost": True,
         }
         status, saved = self.request("PUT", "/api/chat/settings", updated)
@@ -255,6 +297,15 @@ class APITests(unittest.TestCase):
         status, persisted = self.request("GET", "/api/chat/settings")
         self.assertEqual(status, 200)
         self.assertEqual(persisted, updated)
+
+        legacy_settings = {
+            key: value for key, value in updated.items() if key != "retrieval_mode"
+        }
+        status, saved_legacy_settings = self.request(
+            "PUT", "/api/chat/settings", legacy_settings
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(saved_legacy_settings["retrieval_mode"], "semantic")
 
         status, payload = self.request(
             "PUT", "/api/chat/settings", {**updated, "top_k": 9}
@@ -269,10 +320,18 @@ class APITests(unittest.TestCase):
         self.assertIn("ricerca", payload["error"])
 
         status, payload = self.request(
-            "PUT", "/api/chat/settings", {**updated, "show_reasoning": "true"}
+            "PUT",
+            "/api/chat/settings",
+            {**updated, "retrieval_mode": "unknown"},
         )
         self.assertEqual(status, 400)
-        self.assertIn("booleano", payload["error"])
+        self.assertIn("Modalità di ricerca", payload["error"])
+
+        status, payload = self.request(
+            "PUT", "/api/chat/settings", {**updated, "show_reasoning": True}
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("complete", payload["error"])
 
     def test_existing_chat_settings_get_default_embedding_model(self) -> None:
         database = Database(Path(self.temp_dir.name) / "legacy.sqlite3")
@@ -288,6 +347,7 @@ class APITests(unittest.TestCase):
                             "top_k": 4,
                             "memory_mode": "buffer",
                             "budget_tokens": 700,
+                            "show_reasoning": True,
                         }
                     ),
                 ),
@@ -307,7 +367,8 @@ class APITests(unittest.TestCase):
         )
         settings = repository.get()
         self.assertEqual(settings["embedding_model"], "text-embedding-3-small")
-        self.assertFalse(settings["show_reasoning"])
+        self.assertEqual(settings["retrieval_mode"], "semantic")
+        self.assertNotIn("show_reasoning", settings)
         self.assertFalse(settings["show_interaction_cost"])
         with database.connect() as connection:
             row = connection.execute(

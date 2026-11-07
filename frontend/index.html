@@ -177,6 +177,14 @@
                 </div>
                 <div class="settings-fields">
                   <label class="chat-control">
+                    <span>Modalità di ricerca</span>
+                    <select id="chat-retrieval-mode">
+                      <option value="semantic" selected>Semantica · per significato</option>
+                      <option value="hybrid">Ibrida · semantica + parole chiave (BM25)</option>
+                    </select>
+                    <small>La modalità ibrida combina i risultati semantici e lessicali con RRF; può aiutare con nomi e termini esatti.</small>
+                  </label>
+                  <label class="chat-control">
                     <span>Passaggi da consultare</span>
                     <input id="chat-top-k" type="number" min="1" max="8" step="1" value="4">
                     <small>Numero di passaggi rilevanti da includere nella ricerca (da 1 a 8).</small>
@@ -217,13 +225,6 @@
                   </div>
                 </div>
                 <div class="settings-fields">
-                  <label class="settings-toggle">
-                    <span class="settings-toggle-copy">
-                      <strong>Mostra ragionamento</strong>
-                      <small>Visualizza una sintesi dei criteri e delle fonti consultate, non il ragionamento interno dell’AI.</small>
-                    </span>
-                    <input id="chat-show-reasoning" type="checkbox" role="switch">
-                  </label>
                   <label class="settings-toggle">
                     <span class="settings-toggle-copy">
                       <strong>Mostra costo interazione</strong>

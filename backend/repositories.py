@@ -14,10 +14,10 @@ class ChatSettingsRepository:
     _fields = {
         "model",
         "embedding_model",
+        "retrieval_mode",
         "top_k",
         "memory_mode",
         "budget_tokens",
-        "show_reasoning",
         "show_interaction_cost",
     }
 
@@ -27,6 +27,12 @@ class ChatSettingsRepository:
         self.default_model = configuration["default_model"]
         self.embedding_models = configuration["embedding_models"]
         self.default_embedding_model = configuration["default_embedding_model"]
+        self.retrieval_modes = configuration.get(
+            "retrieval_modes", ["semantic", "hybrid"]
+        )
+        self.default_retrieval_mode = configuration.get(
+            "default_retrieval_mode", "semantic"
+        )
 
     def get(self) -> dict[str, Any]:
         with self.database.connect() as connection:
@@ -55,8 +61,9 @@ class ChatSettingsRepository:
             )
             if isinstance(settings, dict):
                 settings.setdefault("embedding_model", self.default_embedding_model)
-                settings.setdefault("show_reasoning", False)
+                settings.setdefault("retrieval_mode", self.default_retrieval_mode)
                 settings.setdefault("show_interaction_cost", False)
+                settings.pop("show_reasoning", None)
             try:
                 settings = self._validate(settings)
             except APIError as error:
@@ -86,16 +93,21 @@ class ChatSettingsRepository:
         return {
             "model": self.default_model,
             "embedding_model": self.default_embedding_model,
+            "retrieval_mode": self.default_retrieval_mode,
             "top_k": 4,
             "memory_mode": "buffer",
             "budget_tokens": 700,
-            "show_reasoning": False,
             "show_interaction_cost": False,
         }
 
     def _validate(self, data: Any) -> dict[str, Any]:
-        if not isinstance(data, dict) or set(data) != self._fields:
+        if not isinstance(data, dict) or frozenset(data) not in {
+            frozenset(self._fields),
+            frozenset(self._fields - {"retrieval_mode"}),
+        }:
             raise APIError(400, "Le impostazioni della chat non sono complete.")
+        data = dict(data)
+        data.setdefault("retrieval_mode", self.default_retrieval_mode)
         if not isinstance(data["model"], str) or data["model"] not in self.models:
             raise APIError(400, "Modello non supportato.")
         if (
@@ -103,6 +115,11 @@ class ChatSettingsRepository:
             or data["embedding_model"] not in self.embedding_models
         ):
             raise APIError(400, "Modello di ricerca non supportato.")
+        if (
+            not isinstance(data["retrieval_mode"], str)
+            or data["retrieval_mode"] not in self.retrieval_modes
+        ):
+            raise APIError(400, "Modalità di ricerca non supportata.")
         if type(data["top_k"]) is not int or not 1 <= data["top_k"] <= 8:
             raise APIError(400, "Il numero di fonti deve essere compreso tra 1 e 8.")
         if not isinstance(data["memory_mode"], str) or data["memory_mode"] not in {
@@ -115,17 +132,15 @@ class ChatSettingsRepository:
             or not 150 <= data["budget_tokens"] <= 4_000
         ):
             raise APIError(400, "Il budget token deve essere compreso tra 150 e 4000.")
-        if type(data["show_reasoning"]) is not bool:
-            raise APIError(400, "Mostra ragionamento deve essere booleano.")
         if type(data["show_interaction_cost"]) is not bool:
             raise APIError(400, "Mostra costo interazione deve essere booleano.")
         return {
             "model": data["model"],
             "embedding_model": data["embedding_model"],
+            "retrieval_mode": data["retrieval_mode"],
             "top_k": data["top_k"],
             "memory_mode": data["memory_mode"],
             "budget_tokens": data["budget_tokens"],
-            "show_reasoning": data["show_reasoning"],
             "show_interaction_cost": data["show_interaction_cost"],
         }
 
@@ -221,6 +236,28 @@ class MedicineRepository:
 class StockRepository:
     def __init__(self, database: Database) -> None:
         self.database = database
+
+    def inventory_summary(self) -> list[dict[str, Any]]:
+        today = date.today().isoformat()
+        with self.database.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT f.id AS medicine_id, f.nome AS name,
+                       COUNT(s.id) AS numero_lotti,
+                       SUM(s.nr_pezzi) AS pezzi_totali,
+                       SUM(CASE WHEN s.data_scadenza >= ? THEN s.nr_pezzi ELSE 0 END)
+                           AS pezzi_non_scaduti,
+                       SUM(CASE WHEN s.data_scadenza < ? THEN s.nr_pezzi ELSE 0 END)
+                           AS pezzi_scaduti
+                FROM farmaci AS f
+                JOIN scorte AS s ON s.farmaco_id = f.id
+                GROUP BY f.id
+                ORDER BY pezzi_non_scaduti DESC, pezzi_totali DESC,
+                         f.nome COLLATE NOCASE, f.id
+                """,
+                (today, today),
+            ).fetchall()
+            return [dict(row) for row in rows]
 
     def list(self, search: str = "") -> list[dict[str, Any]]:
         pattern = f"%{search.strip()}%"
