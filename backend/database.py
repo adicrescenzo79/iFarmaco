@@ -1,9 +1,23 @@
 import csv
+import json
+import re
 import sqlite3
 from contextlib import contextmanager
 from datetime import date
 from pathlib import Path
+from time import monotonic
 from typing import Any, Iterator
+
+
+MAX_READ_QUERY_LENGTH = 4_000
+MAX_READ_QUERY_ROWS = 100
+MAX_READ_QUERY_RESULT_CHARS = 100_000
+READ_QUERY_TIMEOUT_SECONDS = 0.5
+READ_QUERY_TABLES = frozenset({"farmaci", "scorte"})
+READ_QUERY_BLOCKED_FUNCTIONS = frozenset(
+    {"load_extension", "randomblob", "readfile", "writefile", "zeroblob"}
+)
+READ_QUERY_PATTERN = re.compile(r"(?:SELECT|WITH)\b", re.IGNORECASE)
 
 
 MEDICINE_FIELDS = (
@@ -34,6 +48,104 @@ class Database:
         try:
             with connection:
                 yield connection
+        finally:
+            connection.close()
+
+    def query_readonly(self, query: str) -> dict[str, Any]:
+        if (
+            not isinstance(query, str)
+            or not query.strip()
+            or len(query) > MAX_READ_QUERY_LENGTH
+            or not READ_QUERY_PATTERN.match(query.lstrip())
+        ):
+            raise ValueError(
+                "Query non valida: inserisci una SELECT di al massimo "
+                f"{MAX_READ_QUERY_LENGTH} caratteri."
+            )
+
+        connection = sqlite3.connect(
+            f"{self.path.resolve().as_uri()}?mode=ro", uri=True
+        )
+        connection.row_factory = sqlite3.Row
+        deadline = monotonic() + READ_QUERY_TIMEOUT_SECONDS
+        timed_out = False
+
+        def authorize(
+            action: int,
+            first_argument: str | None,
+            second_argument: str | None,
+            database_name: str | None,
+            trigger_name: str | None,
+        ) -> int:
+            del database_name, trigger_name
+            if action == sqlite3.SQLITE_SELECT:
+                return sqlite3.SQLITE_OK
+            if action == sqlite3.SQLITE_READ:
+                return (
+                    sqlite3.SQLITE_OK
+                    if (first_argument or "").casefold() in READ_QUERY_TABLES
+                    else sqlite3.SQLITE_DENY
+                )
+            if action == sqlite3.SQLITE_FUNCTION:
+                function_name = (second_argument or first_argument or "").casefold()
+                return (
+                    sqlite3.SQLITE_DENY
+                    if function_name in READ_QUERY_BLOCKED_FUNCTIONS
+                    else sqlite3.SQLITE_OK
+                )
+            if action == getattr(sqlite3, "SQLITE_RECURSIVE", -1):
+                return sqlite3.SQLITE_OK
+            return sqlite3.SQLITE_DENY
+
+        def interrupt_long_query() -> int:
+            nonlocal timed_out
+            timed_out = monotonic() >= deadline
+            return int(timed_out)
+
+        try:
+            set_limit = getattr(connection, "setlimit", None)
+            if set_limit is not None:
+                set_limit(sqlite3.SQLITE_LIMIT_LENGTH, 1_000_000)
+                set_limit(sqlite3.SQLITE_LIMIT_SQL_LENGTH, MAX_READ_QUERY_LENGTH)
+                set_limit(sqlite3.SQLITE_LIMIT_COLUMN, 50)
+            connection.set_authorizer(authorize)
+            connection.set_progress_handler(interrupt_long_query, 1_000)
+            cursor = connection.execute(query)
+            rows = []
+            result_size = 0
+            truncated = False
+            for row in cursor:
+                if len(rows) >= MAX_READ_QUERY_ROWS:
+                    truncated = True
+                    break
+                values = {
+                    key: (
+                        value.decode("utf-8", errors="replace")
+                        if isinstance(value, bytes)
+                        else value
+                    )
+                    for key, value in dict(row).items()
+                }
+                row_size = len(json.dumps(values, ensure_ascii=False))
+                if result_size + row_size > MAX_READ_QUERY_RESULT_CHARS:
+                    truncated = True
+                    break
+                rows.append(values)
+                result_size += row_size
+            return {
+                "columns": [column[0] for column in cursor.description or ()],
+                "rows": [dict(row) for row in rows],
+                "truncated": truncated,
+            }
+        except sqlite3.Error as error:
+            if timed_out:
+                raise ValueError(
+                    "La query è stata interrotta perché ha superato il limite di tempo."
+                ) from error
+            raise ValueError(
+                "Query non valida o non consentita. Sono ammesse solo letture "
+                "dalle tabelle farmaci e scorte."
+            ) from error
         finally:
             connection.close()
 

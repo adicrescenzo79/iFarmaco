@@ -65,6 +65,66 @@ class DatabaseTests(unittest.TestCase):
                 }
             )
 
+    def test_readonly_query_reads_catalog_and_stock(self) -> None:
+        self.medicines.create(
+            {
+                "id": "00021",
+                "nome": "Farmaco di prova",
+                "casa_produttrice": "Produttore",
+            }
+        )
+        self.stock.create(
+            {
+                "farmaco_id": "00021",
+                "data_scadenza": "2027-01-31",
+                "nr_pezzi": 3,
+            }
+        )
+
+        result = self.database.query_readonly(
+            """
+            SELECT farmaci.nome, scorte.nr_pezzi
+            FROM farmaci
+            JOIN scorte ON scorte.farmaco_id = farmaci.id
+            WHERE farmaci.id = '00021'
+            """
+        )
+
+        self.assertEqual(result["columns"], ["nome", "nr_pezzi"])
+        self.assertEqual(
+            result["rows"], [{"nome": "Farmaco di prova", "nr_pezzi": 3}]
+        )
+        self.assertFalse(result["truncated"])
+
+    def test_readonly_query_rejects_writes_schema_and_multiple_statements(self) -> None:
+        for query in (
+            "DELETE FROM farmaci",
+            "PRAGMA table_info(farmaci)",
+            "SELECT * FROM app_metadata",
+            "SELECT * FROM sqlite_schema",
+            "SELECT * FROM pragma_table_info('farmaci')",
+            "SELECT load_extension('untrusted')",
+            "SELECT zeroblob(1000000000)",
+            "SELECT 1; SELECT 2",
+        ):
+            with self.subTest(query=query):
+                with self.assertRaisesRegex(ValueError, "Query non valida"):
+                    self.database.query_readonly(query)
+
+    def test_readonly_query_caps_returned_rows(self) -> None:
+        with self.database.connect() as connection:
+            connection.executemany(
+                "INSERT INTO farmaci (id, nome) VALUES (?, ?)",
+                [(f"{index:05}", f"Farmaco {index}") for index in range(101)],
+            )
+
+        result = self.database.query_readonly(
+            "SELECT id, nome FROM farmaci ORDER BY id"
+        )
+
+        self.assertEqual(len(result["rows"]), 100)
+        self.assertTrue(result["truncated"])
+
     def test_initialize_imports_csvs_once(self) -> None:
         root = Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory() as temp_dir:

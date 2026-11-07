@@ -444,6 +444,73 @@ class ChatServiceTests(unittest.TestCase):
         self.assertEqual(deltas, ["Risposta ", "documentata."])
         self.assertTrue(client.responses.create.call_args.kwargs["stream"])
 
+    def test_generation_executes_readonly_database_tool_call(self) -> None:
+        MedicineRepository(self.database).create(
+            {
+                "id": "00021",
+                "nome": "Farmaco da query",
+                "casa_produttrice": "Produttore",
+            }
+        )
+        tool_call = SimpleNamespace(
+            type="function_call",
+            name="query_db",
+            arguments=json.dumps(
+                {"sql": "SELECT id, nome FROM farmaci WHERE id = '00021'"}
+            ),
+            call_id="db-call",
+        )
+        client = Mock()
+        client.responses.create.side_effect = [
+            SimpleNamespace(output=[tool_call], output_text="", usage=None),
+            SimpleNamespace(
+                output=[],
+                output_text="Nel catalogo è presente Farmaco da query.",
+                usage=None,
+            ),
+        ]
+
+        answer = ChatService._generate(
+            client,
+            "gpt-4o-mini",
+            [],
+            "Quali farmaci sono nel catalogo?",
+            [],
+            database=self.database,
+        )
+
+        self.assertIn("Farmaco da query", answer)
+        first_call, final_call = client.responses.create.call_args_list
+        self.assertEqual(first_call.kwargs["tools"][0]["name"], "query_db")
+        self.assertEqual(first_call.kwargs["tool_choice"], "auto")
+        self.assertEqual(final_call.kwargs["tool_choice"], "auto")
+        tool_output = final_call.kwargs["input"][-1]
+        self.assertEqual(tool_output["type"], "function_call_output")
+        self.assertEqual(
+            json.loads(tool_output["output"])["rows"],
+            [{"id": "00021", "nome": "Farmaco da query"}],
+        )
+
+    def test_database_catalog_question_uses_generation_without_leaflet_chunks(self) -> None:
+        with (
+            patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}),
+            patch.object(self.service, "_openai_client", return_value=Mock()),
+            patch.object(self.service, "_retrieve_all", return_value=[]),
+            patch.object(
+                self.service, "_generate", return_value="Ho trovato il catalogo."
+            ) as generate,
+            patch.object(ChatService, "_count_tokens", return_value=10),
+        ):
+            result = self.service.respond(
+                {
+                    "session_id": "database-without-leaflets",
+                    "message": "Quali farmaci sono nel catalogo?",
+                }
+            )
+
+        self.assertEqual(result["answer"], "Ho trovato il catalogo.")
+        self.assertEqual(generate.call_args.kwargs["database"], self.database)
+
     def test_chat_turn_and_follow_up_are_saved_with_sources(self) -> None:
         client = Mock()
         chunk = {
@@ -992,10 +1059,108 @@ class ChatServiceTests(unittest.TestCase):
         self.assertEqual(client.responses.create.call_count, 2)
         self.assertEqual(
             client.responses.create.call_args_list[0].kwargs["tool_choice"],
-            "required",
+            {"type": "function", "name": "get_medicine_stock"},
         )
         second_input = client.responses.create.call_args_list[1].kwargs["input"]
         self.assertEqual(second_input[-1]["type"], "function_call_output")
+
+    def test_inventory_agent_can_combine_stock_and_leaflet_search(self) -> None:
+        stock_call = SimpleNamespace(
+            type="function_call",
+            name="get_medicine_stock",
+            arguments=json.dumps({"medicine_name": "Farmaco di prova"}),
+            call_id="call-stock",
+        )
+        leaflet_call = SimpleNamespace(
+            type="function_call",
+            name="search_leaflets",
+            arguments=json.dumps({"query": "indicazioni terapeutiche"}),
+            call_id="call-leaflet",
+        )
+        client = Mock()
+        client.responses.create.side_effect = [
+            SimpleNamespace(output=[stock_call], output_text="", usage=None),
+            SimpleNamespace(output=[leaflet_call], output_text="", usage=None),
+            SimpleNamespace(
+                output=[],
+                output_text="Hai 0 pezzi e il bugiardino riporta le indicazioni.",
+                usage=None,
+            ),
+        ]
+        leaflet_results = []
+
+        answer, tool_results = self.service._answer_inventory(
+            client,
+            "gpt-4o-mini",
+            [],
+            "Cosa dice il bugiardino e quante confezioni ho?",
+            ["Farmaco di prova"],
+            search_leaflets=lambda arguments: leaflet_results.append(arguments)
+            or {"sources": [{"name": "Farmaco di prova", "page": 1}]},
+        )
+
+        self.assertIn("0 pezzi", answer)
+        self.assertEqual(len(tool_results), 1)
+        self.assertEqual(leaflet_results, [{"query": "indicazioni terapeutiche"}])
+        first_call, second_call, _ = client.responses.create.call_args_list
+        self.assertEqual(
+            first_call.kwargs["tool_choice"],
+            {"type": "function", "name": "get_medicine_stock"},
+        )
+        self.assertEqual(second_call.kwargs["tool_choice"], "auto")
+        self.assertEqual(
+            {tool["name"] for tool in first_call.kwargs["tools"]},
+            {"search_leaflets", "get_medicine_stock", "query_db"},
+        )
+
+    def test_mixed_inventory_and_clinical_question_returns_leaflet_sources(self) -> None:
+        stock_call = SimpleNamespace(
+            type="function_call",
+            name="get_medicine_stock",
+            arguments=json.dumps({"medicine_name": "Farmaco di prova"}),
+            call_id="mixed-stock",
+        )
+        leaflet_call = SimpleNamespace(
+            type="function_call",
+            name="search_leaflets",
+            arguments=json.dumps({"query": "a cosa serve Farmaco di prova"}),
+            call_id="mixed-leaflet",
+        )
+        client = Mock()
+        client.responses.create.side_effect = [
+            SimpleNamespace(output=[stock_call], output_text="", usage=None),
+            SimpleNamespace(output=[leaflet_call], output_text="", usage=None),
+            SimpleNamespace(
+                output=[],
+                output_text="Il dato di scorta è aggiornato; il bugiardino descrive le indicazioni.",
+                usage=None,
+            ),
+        ]
+        chunk = {
+            "id": "Farmaco di prova",
+            "medicine_id": "00011",
+            "page": 2,
+            "score": 0.9,
+            "text": "Indicazioni terapeutiche del farmaco.",
+        }
+
+        with (
+            patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}),
+            patch.object(self.service, "_openai_client", return_value=client),
+            patch.object(self.service, "_retrieve", return_value=[chunk]),
+            patch.object(ChatService, "_count_tokens", return_value=10),
+        ):
+            result = self.service.respond(
+                {
+                    "session_id": "mixed-inventory-clinical",
+                    "message": "Quante confezioni di Farmaco di prova ho e a cosa serve?",
+                }
+            )
+
+        self.assertIn("dato di scorta", result["answer"])
+        self.assertEqual(result["sources"][0]["medicine_id"], "00011")
+        self.assertEqual(result["sources"][0]["page"], 2)
+        self.assertEqual(result["medicine_ids"], ["00011"])
 
     def test_inventory_tool_can_be_called_without_a_medicine_name(self) -> None:
         call = SimpleNamespace(
