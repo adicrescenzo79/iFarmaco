@@ -1,3 +1,4 @@
+import asyncio
 import os
 import json
 import hashlib
@@ -5,8 +6,10 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import Mock, patch
 
+from agents import Agent
 from backend.chat_service import ChatUnavailableError, INSTRUCTIONS, ChatService
 from backend.database import Database
 from backend.leaflets import LeafletStore
@@ -64,6 +67,30 @@ class ChatServiceTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
+
+    @staticmethod
+    def _invoke_agent_tools(
+        agent: Any,
+        tool_calls: list[tuple[str, dict[str, Any]]],
+        final_output: str,
+    ) -> SimpleNamespace:
+        tools = {tool.name: tool for tool in agent.tools}
+        outputs = []
+        for name, arguments in tool_calls:
+            tool = tools[name]
+            context = SimpleNamespace(
+                tool_name=name, _function_tool_arguments=None
+            )
+            outputs.append(
+                asyncio.run(
+                    tool.on_invoke_tool._invoke_tool_impl(
+                    context, json.dumps(arguments, ensure_ascii=False)
+                    )
+                )
+            )
+        return SimpleNamespace(
+            final_output=final_output, raw_responses=[], tool_outputs=outputs
+        )
 
     def test_instructions_exclude_unsolicited_personal_habit_advice(self) -> None:
         self.assertIn("non aggiungere consigli generici o non", INSTRUCTIONS)
@@ -178,7 +205,7 @@ class ChatServiceTests(unittest.TestCase):
                 self.service, "_retrieve_all", return_value=[chunk]
             ) as retrieve,
             patch.object(
-                self.service, "_condense", side_effect=lambda _, __, ___, query, ____: query
+                self.service, "_condense", side_effect=lambda _, __, query, ___: query
             ),
             patch.object(
                 self.service, "_generate", return_value="Risposta documentata."
@@ -255,7 +282,7 @@ class ChatServiceTests(unittest.TestCase):
             patch.object(
                 self.service,
                 "_condense",
-                side_effect=lambda _, __, ___, query, ____: query,
+                side_effect=lambda _, __, query, ___: query,
             ),
             patch.object(
                 self.service, "_generate", return_value="Risposta documentata."
@@ -300,7 +327,7 @@ class ChatServiceTests(unittest.TestCase):
             patch.object(
                 self.service,
                 "_condense",
-                side_effect=lambda _, __, ___, query, ____: query,
+                side_effect=lambda _, __, query, ___: query,
             ),
             patch.object(
                 self.service, "_rerank_with_cohere", return_value=[chunk]
@@ -412,37 +439,68 @@ class ChatServiceTests(unittest.TestCase):
         )
 
     def test_streamed_generation_delivers_text_deltas(self) -> None:
-        completed_response = SimpleNamespace(
-            output_text="Risposta documentata.", usage=None
-        )
-        client = Mock()
-        client.responses.create.return_value = iter(
-            [
-                SimpleNamespace(
-                    type="response.output_text.delta", delta="Risposta "
-                ),
-                SimpleNamespace(
-                    type="response.output_text.delta", delta="documentata."
-                ),
-                SimpleNamespace(
-                    type="response.completed", response=completed_response
-                ),
-            ]
-        )
-        deltas = []
+        class StreamedResult:
+            final_output = "Risposta documentata."
+            raw_responses = []
 
-        answer = ChatService._generate(
-            client,
-            "gpt-4o-mini",
-            [{"id": "Farmaco di prova", "page": 2, "text": "Testo"}],
-            "A cosa serve?",
-            [],
-            on_delta=deltas.append,
-        )
+            async def stream_events(self):
+                for delta in ("Risposta ", "documentata."):
+                    yield SimpleNamespace(
+                        type="raw_response_event",
+                        data=SimpleNamespace(
+                            type="response.output_text.delta", delta=delta
+                        ),
+                    )
+
+        with patch(
+            "backend.chat_service.Runner.run_streamed",
+            return_value=StreamedResult(),
+        ) as run_streamed:
+            deltas = []
+            answer = ChatService._generate(
+                "gpt-4o-mini",
+                [{"id": "Farmaco di prova", "page": 2, "text": "Testo"}],
+                "A cosa serve?",
+                [],
+                on_delta=deltas.append,
+            )
 
         self.assertEqual(answer, "Risposta documentata.")
         self.assertEqual(deltas, ["Risposta ", "documentata."])
-        self.assertTrue(client.responses.create.call_args.kwargs["stream"])
+        self.assertEqual(run_streamed.call_args.kwargs["max_turns"], 6)
+
+    def test_agent_runner_records_usage_for_each_model_turn(self) -> None:
+        agent = Agent(name="Test", instructions="Rispondi brevemente.")
+        raw_responses = [
+            SimpleNamespace(
+                usage=SimpleNamespace(input_tokens=12, output_tokens=3)
+            ),
+            SimpleNamespace(
+                usage=SimpleNamespace(input_tokens=20, output_tokens=5)
+            ),
+        ]
+        usage_records = []
+        with patch(
+            "backend.chat_service.Runner.run_sync",
+            return_value=SimpleNamespace(
+                final_output="Risposta.", raw_responses=raw_responses
+            ),
+        ):
+            answer = ChatService._run_agent(
+                agent,
+                "Domanda",
+                "gpt-4o-mini",
+                usage_records=usage_records,
+            )
+
+        self.assertEqual(answer, "Risposta.")
+        self.assertEqual(len(usage_records), 2)
+        self.assertEqual(
+            sum(record["input_tokens"] for record in usage_records), 32
+        )
+        self.assertEqual(
+            sum(record["output_tokens"] for record in usage_records), 8
+        )
 
     def test_generation_executes_readonly_database_tool_call(self) -> None:
         MedicineRepository(self.database).create(
@@ -452,44 +510,53 @@ class ChatServiceTests(unittest.TestCase):
                 "casa_produttrice": "Produttore",
             }
         )
-        tool_call = SimpleNamespace(
-            type="function_call",
-            name="query_db",
-            arguments=json.dumps(
-                {"sql": "SELECT id, nome FROM farmaci WHERE id = '00021'"}
-            ),
-            call_id="db-call",
-        )
-        client = Mock()
-        client.responses.create.side_effect = [
-            SimpleNamespace(output=[tool_call], output_text="", usage=None),
-            SimpleNamespace(
-                output=[],
-                output_text="Nel catalogo è presente Farmaco da query.",
-                usage=None,
-            ),
-        ]
+        run_result = SimpleNamespace(final_output="Ho trovato il farmaco.", raw_responses=[])
+        with patch(
+            "backend.chat_service.Runner.run_sync", return_value=run_result
+        ) as run_sync:
+            answer = ChatService._generate(
+                "gpt-4o-mini",
+                [],
+                "Quali farmaci sono nel catalogo?",
+                [],
+                database=self.database,
+            )
 
-        answer = ChatService._generate(
-            client,
-            "gpt-4o-mini",
-            [],
-            "Quali farmaci sono nel catalogo?",
-            [],
-            database=self.database,
+        self.assertEqual(answer, "Ho trovato il farmaco.")
+        agent = run_sync.call_args.args[0]
+        self.assertEqual({tool.name for tool in agent.tools}, {"query_db"})
+        tool_run = self._invoke_agent_tools(
+            agent,
+            [("query_db", {"sql": "SELECT id, nome FROM farmaci WHERE id = '00021'"})],
+            "Ho trovato il farmaco.",
         )
-
-        self.assertIn("Farmaco da query", answer)
-        first_call, final_call = client.responses.create.call_args_list
-        self.assertEqual(first_call.kwargs["tools"][0]["name"], "query_db")
-        self.assertEqual(first_call.kwargs["tool_choice"], "auto")
-        self.assertEqual(final_call.kwargs["tool_choice"], "auto")
-        tool_output = final_call.kwargs["input"][-1]
-        self.assertEqual(tool_output["type"], "function_call_output")
         self.assertEqual(
-            json.loads(tool_output["output"])["rows"],
+            json.loads(tool_run.tool_outputs[0])["rows"],
             [{"id": "00021", "nome": "Farmaco da query"}],
         )
+
+    def test_catalog_agent_registers_leaflet_and_stock_tools(self) -> None:
+        with patch(
+            "backend.chat_service.Runner.run_sync",
+            return_value=SimpleNamespace(final_output="Risposta combinata.", raw_responses=[]),
+        ) as run_sync:
+            answer = ChatService._generate(
+                "gpt-4o-mini",
+                [],
+                "Domanda combinata",
+                [],
+                database=self.database,
+                inventory_tool=lambda arguments: {"query": arguments["medicine_name"]},
+                search_leaflets=lambda arguments: {"sources": []},
+            )
+
+        self.assertEqual(answer, "Risposta combinata.")
+        agent = run_sync.call_args.args[0]
+        self.assertEqual(
+            {tool.name for tool in agent.tools},
+            {"query_db", "get_medicine_stock", "search_leaflets"},
+        )
+
 
     def test_database_catalog_question_uses_generation_without_leaflet_chunks(self) -> None:
         with (
@@ -524,7 +591,7 @@ class ChatServiceTests(unittest.TestCase):
             patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}),
             patch.object(self.service, "_openai_client", return_value=client),
             patch.object(self.service, "_retrieve", return_value=[chunk]),
-            patch.object(self.service, "_condense", side_effect=lambda _, __, ___, query, ____: query),
+            patch.object(self.service, "_condense", side_effect=lambda _, __, query, ___: query),
             patch.object(self.service, "_generate", return_value="Risposta documentata.") as generate,
             patch.object(ChatService, "_count_tokens", return_value=10),
         ):
@@ -561,14 +628,23 @@ class ChatServiceTests(unittest.TestCase):
             {"role": "user", "content": "Domanda recente"},
             {"role": "assistant", "content": "Risposta recente"},
         ]
-        client = Mock()
-        client.responses.create.return_value = SimpleNamespace(output_text="Farmaco e contesto")
-        with patch.object(ChatService, "_count_tokens", side_effect=[200, 80]):
-            self.service._summarize_if_needed(client, "gpt-4o-mini", history, 150)
+        with (
+            patch.object(ChatService, "_count_tokens", side_effect=[200, 80]),
+            patch(
+                "backend.chat_service.Runner.run_sync",
+                return_value=SimpleNamespace(
+                    final_output="Farmaco e contesto", raw_responses=[]
+                ),
+            ) as run_sync,
+        ):
+            self.service._summarize_if_needed("gpt-4o-mini", history, 150)
 
         self.assertEqual(len(history), 4)
         self.assertIn("Farmaco e contesto", history[0]["content"])
         self.assertEqual(history[-2]["content"], "Domanda recente")
+        self.assertEqual(
+            run_sync.call_args.args[0].name, "Riassuntore della conversazione"
+        )
 
     def test_multiple_medicine_names_are_retrieved_without_selection(self) -> None:
         client = Mock()
@@ -589,7 +665,7 @@ class ChatServiceTests(unittest.TestCase):
             patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}),
             patch.object(self.service, "_openai_client", return_value=client),
             patch.object(self.service, "_retrieve", side_effect=[[chunks[0]], [chunks[1]]]) as retrieve,
-            patch.object(self.service, "_condense", side_effect=lambda _, __, ___, query, ____: query),
+            patch.object(self.service, "_condense", side_effect=lambda _, __, query, ___: query),
             patch.object(self.service, "_generate", return_value="Confronto documentato."),
             patch.object(ChatService, "_count_tokens", return_value=10),
         ):
@@ -816,8 +892,8 @@ class ChatServiceTests(unittest.TestCase):
             )
 
         self.assertEqual(result["answer"], "Hai antibiotici disponibili.")
-        self.assertEqual(answer_inventory.call_args.args[2], [])
-        self.assertEqual(answer_inventory.call_args.args[4], [])
+        self.assertEqual(answer_inventory.call_args.args[1], [])
+        self.assertEqual(answer_inventory.call_args.args[3], [])
         retrieve_one.assert_not_called()
         self.assertTrue(
             ChatService._is_inventory_question(
@@ -869,7 +945,7 @@ class ChatServiceTests(unittest.TestCase):
             )
 
         self.assertEqual(result["answer"], "Risposta sul nuovo argomento.")
-        self.assertEqual(condense.call_args.args[2], [])
+        self.assertEqual(condense.call_args.args[1], [])
         retrieve_one.assert_not_called()
         retrieve_all.assert_called_once()
 
@@ -1034,108 +1110,62 @@ class ChatServiceTests(unittest.TestCase):
         openai_client.assert_not_called()
 
     def test_inventory_request_runs_function_call_and_returns_model_answer(self) -> None:
-        call = SimpleNamespace(
-            type="function_call",
-            name="get_medicine_stock",
-            arguments=json.dumps({"medicine_name": "Ximocillina"}),
-            call_id="call-stock-1",
-        )
-        client = Mock()
-        client.responses.create.side_effect = [
-            SimpleNamespace(output=[call], output_text=""),
-            SimpleNamespace(output=[], output_text="Hai 12 pezzi non scaduti."),
-        ]
-
-        answer, tool_results = self.service._answer_inventory(
-            client,
-            "gpt-4o-mini",
-            [],
-            "Quante Ximocillina ho?",
-            [],
-        )
+        with patch(
+            "backend.chat_service.Runner.run_sync",
+            side_effect=lambda agent, *_args, **_kwargs: self._invoke_agent_tools(
+                agent,
+                [("get_medicine_stock", {"medicine_name": "Ximocillina"})],
+                "Hai 12 pezzi non scaduti.",
+            ),
+        ) as run_sync:
+            answer, tool_results = self.service._answer_inventory(
+                "gpt-4o-mini",
+                [],
+                "Quante Ximocillina ho?",
+                [],
+            )
 
         self.assertEqual(answer, "Hai 12 pezzi non scaduti.")
         self.assertEqual(tool_results[0]["matches"][0]["pezzi_non_scaduti"], 12)
-        self.assertEqual(client.responses.create.call_count, 2)
-        self.assertEqual(
-            client.responses.create.call_args_list[0].kwargs["tool_choice"],
-            {"type": "function", "name": "get_medicine_stock"},
-        )
-        second_input = client.responses.create.call_args_list[1].kwargs["input"]
-        self.assertEqual(second_input[-1]["type"], "function_call_output")
+        self.assertEqual(run_sync.call_args.kwargs["max_turns"], 6)
+        agent = run_sync.call_args.args[0]
+        self.assertEqual(agent.model_settings.tool_choice, "required")
 
     def test_inventory_agent_can_combine_stock_and_leaflet_search(self) -> None:
-        stock_call = SimpleNamespace(
-            type="function_call",
-            name="get_medicine_stock",
-            arguments=json.dumps({"medicine_name": "Farmaco di prova"}),
-            call_id="call-stock",
-        )
-        leaflet_call = SimpleNamespace(
-            type="function_call",
-            name="search_leaflets",
-            arguments=json.dumps({"query": "indicazioni terapeutiche"}),
-            call_id="call-leaflet",
-        )
-        client = Mock()
-        client.responses.create.side_effect = [
-            SimpleNamespace(output=[stock_call], output_text="", usage=None),
-            SimpleNamespace(output=[leaflet_call], output_text="", usage=None),
-            SimpleNamespace(
-                output=[],
-                output_text="Hai 0 pezzi e il bugiardino riporta le indicazioni.",
-                usage=None,
-            ),
-        ]
         leaflet_results = []
 
-        answer, tool_results = self.service._answer_inventory(
-            client,
-            "gpt-4o-mini",
-            [],
-            "Cosa dice il bugiardino e quante confezioni ho?",
-            ["Farmaco di prova"],
-            search_leaflets=lambda arguments: leaflet_results.append(arguments)
-            or {"sources": [{"name": "Farmaco di prova", "page": 1}]},
-        )
+        with patch(
+            "backend.chat_service.Runner.run_sync",
+            side_effect=lambda agent, *_args, **_kwargs: self._invoke_agent_tools(
+                agent,
+                [
+                    ("get_medicine_stock", {"medicine_name": "Farmaco di prova"}),
+                    ("search_leaflets", {"query": "indicazioni terapeutiche"}),
+                ],
+                "Hai 0 pezzi e il bugiardino riporta le indicazioni.",
+            ),
+        ) as run_sync:
+            answer, tool_results = self.service._answer_inventory(
+                "gpt-4o-mini",
+                [],
+                "Cosa dice il bugiardino e quante confezioni ho?",
+                ["Farmaco di prova"],
+                search_leaflets=lambda arguments: leaflet_results.append(arguments)
+                or {"sources": [{"name": "Farmaco di prova", "page": 1}]},
+            )
 
         self.assertIn("0 pezzi", answer)
         self.assertEqual(len(tool_results), 1)
         self.assertEqual(leaflet_results, [{"query": "indicazioni terapeutiche"}])
-        first_call, second_call, _ = client.responses.create.call_args_list
+        agent = run_sync.call_args.args[0]
+        self.assertEqual(agent.model_settings.tool_choice, "required")
         self.assertEqual(
-            first_call.kwargs["tool_choice"],
-            {"type": "function", "name": "get_medicine_stock"},
-        )
-        self.assertEqual(second_call.kwargs["tool_choice"], "auto")
-        self.assertEqual(
-            {tool["name"] for tool in first_call.kwargs["tools"]},
+            {tool.name for tool in agent.tools},
             {"search_leaflets", "get_medicine_stock", "query_db"},
         )
 
     def test_mixed_inventory_and_clinical_question_returns_leaflet_sources(self) -> None:
-        stock_call = SimpleNamespace(
-            type="function_call",
-            name="get_medicine_stock",
-            arguments=json.dumps({"medicine_name": "Farmaco di prova"}),
-            call_id="mixed-stock",
-        )
-        leaflet_call = SimpleNamespace(
-            type="function_call",
-            name="search_leaflets",
-            arguments=json.dumps({"query": "a cosa serve Farmaco di prova"}),
-            call_id="mixed-leaflet",
-        )
         client = Mock()
-        client.responses.create.side_effect = [
-            SimpleNamespace(output=[stock_call], output_text="", usage=None),
-            SimpleNamespace(output=[leaflet_call], output_text="", usage=None),
-            SimpleNamespace(
-                output=[],
-                output_text="Il dato di scorta è aggiornato; il bugiardino descrive le indicazioni.",
-                usage=None,
-            ),
-        ]
         chunk = {
             "id": "Farmaco di prova",
             "medicine_id": "00011",
@@ -1149,6 +1179,20 @@ class ChatServiceTests(unittest.TestCase):
             patch.object(self.service, "_openai_client", return_value=client),
             patch.object(self.service, "_retrieve", return_value=[chunk]),
             patch.object(ChatService, "_count_tokens", return_value=10),
+            patch(
+                "backend.chat_service.Runner.run_sync",
+                side_effect=lambda agent, *_args, **_kwargs: self._invoke_agent_tools(
+                    agent,
+                    [
+                        ("get_medicine_stock", {"medicine_name": "Farmaco di prova"}),
+                        (
+                            "search_leaflets",
+                            {"query": "a cosa serve Farmaco di prova"},
+                        ),
+                    ],
+                    "Il dato di scorta è aggiornato; il bugiardino descrive le indicazioni.",
+                ),
+            ),
         ):
             result = self.service.respond(
                 {
@@ -1163,25 +1207,20 @@ class ChatServiceTests(unittest.TestCase):
         self.assertEqual(result["medicine_ids"], ["00011"])
 
     def test_inventory_tool_can_be_called_without_a_medicine_name(self) -> None:
-        call = SimpleNamespace(
-            type="function_call",
-            name="get_medicine_stock",
-            arguments=json.dumps({"medicine_name": ""}),
-            call_id="call-all-stock",
-        )
-        client = Mock()
-        client.responses.create.side_effect = [
-            SimpleNamespace(output=[call], output_text=""),
-            SimpleNamespace(output=[], output_text="Il farmaco più disponibile è..."),
-        ]
-
-        answer, tool_results = self.service._answer_inventory(
-            client,
-            "gpt-4o-mini",
-            [],
-            "Quale farmaco ha più scorte non scadute?",
-            [],
-        )
+        with patch(
+            "backend.chat_service.Runner.run_sync",
+            side_effect=lambda agent, *_args, **_kwargs: self._invoke_agent_tools(
+                agent,
+                [("get_medicine_stock", {"medicine_name": ""})],
+                "Il farmaco più disponibile è...",
+            ),
+        ):
+            answer, tool_results = self.service._answer_inventory(
+                "gpt-4o-mini",
+                [],
+                "Quale farmaco ha più scorte non scadute?",
+                [],
+            )
 
         self.assertIn("più disponibile", answer)
         self.assertEqual(tool_results[0]["matches"][0]["medicine_id"], "00013")
@@ -1260,7 +1299,7 @@ class ChatServiceTests(unittest.TestCase):
             ),
             patch.object(self.service, "_retrieve", return_value=[chunk]) as retrieve,
             patch.object(
-                self.service, "_condense", side_effect=lambda _, __, ___, query, ____: query
+                self.service, "_condense", side_effect=lambda _, __, query, ___: query
             ),
             patch.object(self.service, "_generate", return_value="Risposta dal bugiardino."),
             patch.object(ChatService, "_count_tokens", return_value=10),
@@ -1313,7 +1352,7 @@ class ChatServiceTests(unittest.TestCase):
                 self.service, "_retrieve", side_effect=[[chunk] for chunk in chunks]
             ) as retrieve,
             patch.object(
-                self.service, "_condense", side_effect=lambda _, __, ___, query, ____: query
+                self.service, "_condense", side_effect=lambda _, __, query, ___: query
             ),
             patch.object(self.service, "_generate", return_value="Confronto documentato."),
             patch.object(ChatService, "_count_tokens", return_value=10),

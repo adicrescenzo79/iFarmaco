@@ -131,7 +131,7 @@ def _print_generation(
 ) -> None:
     usage: list[dict[str, Any]] = []
     answer = service._generate(
-        client, model, chunks, case.question, [], usage_records=usage
+        model, chunks, case.question, [], usage_records=usage
     )
     print(f"  Risposta: {answer}")
     if case.expected_evidence is None:

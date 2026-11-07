@@ -5,3 +5,4 @@ pypdf
 tiktoken
 rank-bm25
 cohere
+openai-agents
