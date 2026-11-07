@@ -2,6 +2,7 @@ const defaultChatSettings = {
   model: "gpt-4o-mini",
   embedding_model: "text-embedding-3-small",
   retrieval_mode: "semantic",
+  reranker_mode: "none",
   top_k: 4,
   memory_mode: "buffer",
   budget_tokens: 700,
@@ -93,6 +94,8 @@ const elements = {
   chatModel: document.querySelector("#chat-model"),
   chatEmbeddingModel: document.querySelector("#chat-embedding-model"),
   chatRetrievalMode: document.querySelector("#chat-retrieval-mode"),
+  chatRerankerControl: document.querySelector("#chat-reranker-control"),
+  chatRerankerMode: document.querySelector("#chat-reranker-mode"),
   chatTopK: document.querySelector("#chat-top-k"),
   chatMemory: document.querySelector("#chat-memory"),
   chatBudget: document.querySelector("#chat-budget"),
@@ -568,7 +571,7 @@ function renderChat(messages = [], pending = false) {
         currency: "USD",
         minimumFractionDigits: 6,
         maximumFractionDigits: 8,
-      }).format(message.interaction_cost_usd)} · calcolo indicativo sui token API`;
+      }).format(message.interaction_cost_usd)} · stima token OpenAI; costi Cohere esclusi`;
       details.append(cost);
       content.append(details);
     }
@@ -620,10 +623,26 @@ async function initializeChat() {
         : "Semantica · per significato";
       elements.chatRetrievalMode.append(option);
     });
+    elements.chatRerankerMode.replaceChildren();
+    const rerankerModes = config.cohere_configured
+      ? (config.reranker_modes || ["none", "cohere"])
+      : ["none"];
+    rerankerModes.forEach((mode) => {
+      const option = document.createElement("option");
+      option.value = mode;
+      option.textContent = mode === "cohere"
+        ? "Cohere Rerank · ordina i candidati per pertinenza"
+        : "Nessuno · usa l’ordine della ricerca";
+      elements.chatRerankerMode.append(option);
+    });
+    elements.chatRerankerControl.hidden = !config.cohere_configured;
     state.chatSettings = { ...defaultChatSettings, ...settings };
     elements.chatModel.value = state.chatSettings.model;
     elements.chatEmbeddingModel.value = state.chatSettings.embedding_model;
     elements.chatRetrievalMode.value = state.chatSettings.retrieval_mode;
+    elements.chatRerankerMode.value = config.cohere_configured
+      ? state.chatSettings.reranker_mode
+      : "none";
     elements.chatTopK.value = state.chatSettings.top_k;
     elements.chatMemory.value = state.chatSettings.memory_mode;
     elements.chatBudget.value = state.chatSettings.budget_tokens;
@@ -719,6 +738,7 @@ async function saveChatSettings(event) {
     model: elements.chatModel.value,
     embedding_model: elements.chatEmbeddingModel.value,
     retrieval_mode: elements.chatRetrievalMode.value,
+    reranker_mode: elements.chatRerankerMode.value,
     top_k: Number(elements.chatTopK.value),
     memory_mode: elements.chatMemory.value,
     budget_tokens: Number(elements.chatBudget.value),

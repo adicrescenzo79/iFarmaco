@@ -184,6 +184,14 @@
                     </select>
                     <small>La modalità ibrida combina i risultati semantici e lessicali con RRF; può aiutare con nomi e termini esatti.</small>
                   </label>
+                  <label class="chat-control" id="chat-reranker-control" hidden>
+                    <span>Riordino dei passaggi</span>
+                    <select id="chat-reranker-mode">
+                      <option value="none" selected>Nessuno · usa l’ordine della ricerca</option>
+                      <option value="cohere">Cohere Rerank · ordina i candidati per pertinenza</option>
+                    </select>
+                    <small>Facoltativo. La domanda e i passaggi candidati vengono inviati a Cohere per il riordino.</small>
+                  </label>
                   <label class="chat-control">
                     <span>Passaggi da consultare</span>
                     <input id="chat-top-k" type="number" min="1" max="8" step="1" value="4">
@@ -228,7 +236,7 @@
                   <label class="settings-toggle">
                     <span class="settings-toggle-copy">
                       <strong>Mostra costo interazione</strong>
-                      <small>Visualizza una stima in USD basata sui token comunicati dall’API; l’importo fatturato può variare.</small>
+                      <small>Stima in USD dei token OpenAI; non include eventuali costi Cohere. L’importo fatturato può variare.</small>
                     </span>
                     <input id="chat-show-interaction-cost" type="checkbox" role="switch">
                   </label>

@@ -24,6 +24,11 @@ EMBEDDING_MODELS = ("text-embedding-3-small", "text-embedding-3-large")
 DEFAULT_EMBEDDING_MODEL = EMBEDDING_MODELS[0]
 RETRIEVAL_MODES = ("semantic", "hybrid")
 DEFAULT_RETRIEVAL_MODE = "semantic"
+RERANKER_MODES = ("none", "cohere")
+DEFAULT_RERANKER_MODE = "none"
+COHERE_RERANK_MODEL = "rerank-v3.5"
+RERANK_CANDIDATE_MULTIPLIER = 5
+MAX_RERANK_CANDIDATES = 50
 RRF_CONSTANT = 60
 MODEL_PRICES_USD_PER_MILLION = {
     "gpt-4o-mini": (0.15, 0.60),
@@ -91,7 +96,12 @@ INVENTORY_TERMS = re.compile(
     re.IGNORECASE,
 )
 EXPIRY_QUESTION = re.compile(
-    r"\bscadut[oi]\b", re.IGNORECASE
+    r"\b(?:scad(?:e|ono|ere|ut[oi]|uta|ute|enz[ae])|"
+    r"scadr(?:à|a|anno|ei|ebbe|ebbero|emo|ete|ò|o))\b",
+    re.IGNORECASE,
+)
+EXPIRED_STOCK_QUESTION = re.compile(
+    r"\bscadut[oi]\b|\bscaduta\b|\bscadute\b", re.IGNORECASE
 )
 INVENTORY_QUANTITY = re.compile(
     r"\b(quante?|quanti)\b.*\b(ho|restano|rimangono|disponibili|"
@@ -154,6 +164,7 @@ class ChatService:
         self.sessions_dir = sessions_dir
         self.chroma_dir = chroma_dir
         self._client: Any = None
+        self._cohere_client: Any = None
         self._vector_client: Any = None
         self._collections: dict[str, Any] = {}
         self._bm25_indices: dict[
@@ -170,6 +181,9 @@ class ChatService:
             "default_embedding_model": DEFAULT_EMBEDDING_MODEL,
             "retrieval_modes": list(RETRIEVAL_MODES),
             "default_retrieval_mode": DEFAULT_RETRIEVAL_MODE,
+            "reranker_modes": list(RERANKER_MODES),
+            "default_reranker_mode": DEFAULT_RERANKER_MODE,
+            "cohere_configured": bool(os.getenv("COHERE_API_KEY", "").strip()),
         }
 
     @staticmethod
@@ -338,6 +352,13 @@ class ChatService:
         retrieval_mode = payload.get("retrieval_mode", DEFAULT_RETRIEVAL_MODE)
         if retrieval_mode not in RETRIEVAL_MODES:
             raise ValueError("Modalità di ricerca non supportata.")
+        reranker_mode = payload.get("reranker_mode", DEFAULT_RERANKER_MODE)
+        if reranker_mode not in RERANKER_MODES:
+            raise ValueError("Reranker non supportato.")
+        if reranker_mode == "cohere" and not os.getenv("COHERE_API_KEY", "").strip():
+            raise ChatUnavailableError(
+                "Per usare Cohere configura COHERE_API_KEY nel file .env e riavvia l'app."
+            )
         show_interaction_cost = payload.get("show_interaction_cost", False)
         if type(show_interaction_cost) is not bool:
             raise ValueError("Le preferenze di visualizzazione devono essere booleane.")
@@ -354,26 +375,58 @@ class ChatService:
             raise ValueError("Modalità memoria non supportata.")
 
         history = saved["messages"][-100:]
+        retrieval_k = (
+            min(MAX_RERANK_CANDIDATES, max(top_k, top_k * RERANK_CANDIDATE_MULTIPLIER))
+            if reranker_mode == "cohere"
+            else top_k
+        )
         context_history = history.copy() if contextual_follow_up else []
         inventory_question = self._is_inventory_question(
             message, medicine_mentioned=bool(mentioned)
         )
-        if EXPIRY_QUESTION.search(message):
-            expiry_medicines = mentioned or MedicineRepository(self.database).list()
-            expired = self._expired_stock(expiry_medicines)
-            if expired:
-                details = []
-                for medicine in expired:
-                    lots = ", ".join(
-                        f"{lot['nr_pezzi']} pezzi (scadenza "
-                        f"{date.fromisoformat(lot['data_scadenza']).strftime('%d/%m/%Y')})"
-                        for lot in medicine["lotti"]
-                    )
-                    details.append(f"- {medicine['nome']}: {lots}")
-                answer = "Risultano queste scorte scadute:\n" + "\n".join(details)
+        if self._is_expiry_question(message):
+            expiry_medicines = (
+                mentioned or medicines or MedicineRepository(self.database).list()
+            )
+            if EXPIRED_STOCK_QUESTION.search(message):
+                expiry_lots = self._expired_stock(expiry_medicines)
+                if expiry_lots:
+                    details = []
+                    for medicine in expiry_lots:
+                        lots = ", ".join(
+                            f"{lot['nr_pezzi']} pezzi (scadenza "
+                            f"{date.fromisoformat(lot['data_scadenza']).strftime('%d/%m/%Y')})"
+                            for lot in medicine["lotti"]
+                        )
+                        details.append(f"- {medicine['nome']}: {lots}")
+                    answer = "Risultano queste scorte scadute:\n" + "\n".join(details)
+                else:
+                    answer = "Non risultano scorte scadute tra i farmaci registrati."
+                result_medicines = expiry_lots
             else:
-                answer = "Non risultano scorte scadute tra i farmaci registrati."
-            medicine_ids = [medicine["medicine_id"] for medicine in expired]
+                details = []
+                result_medicines = []
+                stock = StockRepository(self.database)
+                for medicine in expiry_medicines:
+                    lots = stock.for_medicine(medicine["id"])
+                    if not lots:
+                        continue
+                    result_medicines.append(
+                        {"medicine_id": medicine["id"], "nome": medicine["nome"]}
+                    )
+                    lot_details = ", ".join(
+                        f"{lot['nr_pezzi']} pezzi, scadenza "
+                        f"{date.fromisoformat(lot['data_scadenza']).strftime('%d/%m/%Y')}"
+                        for lot in lots
+                    )
+                    details.append(f"- {medicine['nome']}: {lot_details}")
+                answer = (
+                    "Scadenze dei lotti registrati:\n" + "\n".join(details)
+                    if details
+                    else "Non risultano lotti registrati per i farmaci cercati. "
+                    "Controlla la data riportata sulla confezione."
+                )
+            medicine_ids = [medicine["medicine_id"] for medicine in result_medicines]
             assistant_message = {
                 "role": "assistant",
                 "content": answer,
@@ -394,7 +447,7 @@ class ChatService:
                 "medicine_id": medicine_ids[0] if medicine_ids else "",
                 "medicine_ids": medicine_ids,
                 "medicine_names": [
-                    medicine["nome"] for medicine in expired
+                    medicine["nome"] for medicine in result_medicines
                 ],
                 "answer": answer,
                 "searched_query": message,
@@ -583,7 +636,7 @@ class ChatService:
                             client,
                             medicine,
                             searched_query,
-                            top_k,
+                            retrieval_k,
                             embedding_model,
                             usage_records=usage_records,
                             search_mode=retrieval_mode,
@@ -621,7 +674,7 @@ class ChatService:
                 chunks = self._retrieve_all(
                     client,
                     searched_query,
-                    top_k,
+                    retrieval_k,
                     embedding_model,
                     usage_records=usage_records,
                     diversify_by_medicine=True,
@@ -633,13 +686,18 @@ class ChatService:
                 chunks = self._retrieve_all(
                     client,
                     searched_query,
-                    top_k,
+                    retrieval_k,
                     embedding_model,
                     usage_records=usage_records,
                     search_mode=retrieval_mode,
                 )
-            chunks.sort(key=lambda chunk: chunk["score"], reverse=True)
-            chunks = chunks[:top_k]
+            if reranker_mode == "cohere" and chunks:
+                chunks = self._rerank_with_cohere(
+                    searched_query, chunks[:MAX_RERANK_CANDIDATES], top_k
+                )
+            else:
+                chunks.sort(key=lambda chunk: chunk["score"], reverse=True)
+                chunks = chunks[:top_k]
             answer = (
                 self._generate(
                     client,
@@ -900,10 +958,14 @@ class ChatService:
         ]
 
     @staticmethod
+    def _is_expiry_question(message: str) -> bool:
+        return bool(EXPIRY_QUESTION.search(message))
+
+    @staticmethod
     def _is_inventory_question(
         message: str, *, medicine_mentioned: bool = False
     ) -> bool:
-        if INVENTORY_TERMS.search(message):
+        if EXPIRY_QUESTION.search(message) or INVENTORY_TERMS.search(message):
             return True
         if (
             MEDICINE_OWNERSHIP_QUESTION.search(message)
@@ -1103,6 +1165,49 @@ class ChatService:
 
             self._client = OpenAI()
         return self._client
+
+    def _rerank_with_cohere(
+        self, query: str, chunks: list[dict[str, Any]], top_k: int
+    ) -> list[dict[str, Any]]:
+        if not chunks:
+            return []
+        api_key = os.getenv("COHERE_API_KEY", "").strip()
+        if not api_key:
+            raise ChatUnavailableError(
+                "Per usare Cohere configura COHERE_API_KEY nel file .env e riavvia l'app."
+            )
+        if self._cohere_client is None:
+            import cohere
+
+            self._cohere_client = cohere.ClientV2(api_key=api_key)
+
+        response = self._cohere_client.rerank(
+            model=COHERE_RERANK_MODEL,
+            query=query,
+            documents=[chunk["text"] for chunk in chunks],
+            top_n=min(top_k, len(chunks)),
+        )
+        ranked_chunks = []
+        seen_indices = set()
+        for result in response.results:
+            if (
+                type(result.index) is not int
+                or not 0 <= result.index < len(chunks)
+                or result.index in seen_indices
+            ):
+                continue
+            seen_indices.add(result.index)
+            ranked_chunks.append(
+                {
+                    **chunks[result.index],
+                    "score": float(result.relevance_score),
+                }
+            )
+        if len(ranked_chunks) != min(top_k, len(chunks)):
+            raise RuntimeError(
+                "Cohere ha restituito un numero inatteso di passaggi riordinati."
+            )
+        return ranked_chunks
 
     def _vector_collection(
         self, embedding_model: str = DEFAULT_EMBEDDING_MODEL

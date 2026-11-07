@@ -13,6 +13,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from backend.database import Database
+from backend.errors import APIError
 from backend.leaflets import LeafletStore
 from backend.repositories import ChatSettingsRepository
 from backend.server import create_server
@@ -270,6 +271,7 @@ class APITests(unittest.TestCase):
         self.assertEqual(settings["model"], "gpt-4o-mini")
         self.assertEqual(settings["embedding_model"], "text-embedding-3-small")
         self.assertEqual(settings["retrieval_mode"], "semantic")
+        self.assertEqual(settings["reranker_mode"], "none")
         self.assertEqual(settings["top_k"], 4)
         self.assertEqual(settings["memory_mode"], "buffer")
         self.assertEqual(settings["budget_tokens"], 700)
@@ -285,6 +287,7 @@ class APITests(unittest.TestCase):
             "model": "gpt-4.1-mini",
             "embedding_model": "text-embedding-3-large",
             "retrieval_mode": "hybrid",
+            "reranker_mode": "none",
             "top_k": 6,
             "memory_mode": "summary",
             "budget_tokens": 1_200,
@@ -299,13 +302,16 @@ class APITests(unittest.TestCase):
         self.assertEqual(persisted, updated)
 
         legacy_settings = {
-            key: value for key, value in updated.items() if key != "retrieval_mode"
+            key: value
+            for key, value in updated.items()
+            if key not in {"retrieval_mode", "reranker_mode"}
         }
         status, saved_legacy_settings = self.request(
             "PUT", "/api/chat/settings", legacy_settings
         )
         self.assertEqual(status, 200)
         self.assertEqual(saved_legacy_settings["retrieval_mode"], "semantic")
+        self.assertEqual(saved_legacy_settings["reranker_mode"], "none")
 
         status, payload = self.request(
             "PUT", "/api/chat/settings", {**updated, "top_k": 9}
@@ -344,6 +350,7 @@ class APITests(unittest.TestCase):
                     json.dumps(
                         {
                             "model": "gpt-4o-mini",
+                            "reranker_mode": "cohere",
                             "top_k": 4,
                             "memory_mode": "buffer",
                             "budget_tokens": 700,
@@ -368,6 +375,7 @@ class APITests(unittest.TestCase):
         settings = repository.get()
         self.assertEqual(settings["embedding_model"], "text-embedding-3-small")
         self.assertEqual(settings["retrieval_mode"], "semantic")
+        self.assertEqual(settings["reranker_mode"], "none")
         self.assertNotIn("show_reasoning", settings)
         self.assertFalse(settings["show_interaction_cost"])
         with database.connect() as connection:
@@ -375,6 +383,46 @@ class APITests(unittest.TestCase):
                 "SELECT valore FROM app_metadata WHERE chiave = 'chat_settings'"
             ).fetchone()
         self.assertEqual(json.loads(row["valore"]), settings)
+
+    def test_cohere_reranker_setting_is_optional(self) -> None:
+        database = Database(Path(self.temp_dir.name) / "cohere.sqlite3")
+        database.initialize()
+        configuration = {
+            "models": ["gpt-4o-mini"],
+            "default_model": "gpt-4o-mini",
+            "embedding_models": ["text-embedding-3-small"],
+            "default_embedding_model": "text-embedding-3-small",
+            "retrieval_modes": ["semantic", "hybrid"],
+            "default_retrieval_mode": "semantic",
+            "reranker_modes": ["none", "cohere"],
+            "default_reranker_mode": "none",
+            "cohere_configured": False,
+        }
+        settings = {
+            "model": "gpt-4o-mini",
+            "embedding_model": "text-embedding-3-small",
+            "retrieval_mode": "semantic",
+            "reranker_mode": "cohere",
+            "top_k": 4,
+            "memory_mode": "buffer",
+            "budget_tokens": 700,
+            "show_interaction_cost": False,
+        }
+
+        unavailable = ChatSettingsRepository(database, configuration)
+        with self.assertRaisesRegex(APIError, "Cohere non è configurato"):
+            unavailable.update(settings)
+
+        with database.connect() as connection:
+            connection.execute(
+                "INSERT INTO app_metadata (chiave, valore) VALUES (?, ?)",
+                ("chat_settings", json.dumps(settings)),
+            )
+        self.assertEqual(unavailable.get()["reranker_mode"], "none")
+
+        configuration["cohere_configured"] = True
+        available = ChatSettingsRepository(database, configuration)
+        self.assertEqual(available.update(settings)["reranker_mode"], "cohere")
 
     def test_frontend_is_served_by_backend(self) -> None:
         connection = HTTPConnection("127.0.0.1", self.server.server_port, timeout=3)

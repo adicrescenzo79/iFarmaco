@@ -15,6 +15,7 @@ class ChatSettingsRepository:
         "model",
         "embedding_model",
         "retrieval_mode",
+        "reranker_mode",
         "top_k",
         "memory_mode",
         "budget_tokens",
@@ -33,6 +34,13 @@ class ChatSettingsRepository:
         self.default_retrieval_mode = configuration.get(
             "default_retrieval_mode", "semantic"
         )
+        self.reranker_modes = configuration.get(
+            "reranker_modes", ["none", "cohere"]
+        )
+        self.default_reranker_mode = configuration.get(
+            "default_reranker_mode", "none"
+        )
+        self.cohere_configured = configuration.get("cohere_configured", False)
 
     def get(self) -> dict[str, Any]:
         with self.database.connect() as connection:
@@ -62,6 +70,9 @@ class ChatSettingsRepository:
             if isinstance(settings, dict):
                 settings.setdefault("embedding_model", self.default_embedding_model)
                 settings.setdefault("retrieval_mode", self.default_retrieval_mode)
+                settings.setdefault("reranker_mode", self.default_reranker_mode)
+                if settings["reranker_mode"] == "cohere" and not self.cohere_configured:
+                    settings["reranker_mode"] = self.default_reranker_mode
                 settings.setdefault("show_interaction_cost", False)
                 settings.pop("show_reasoning", None)
             try:
@@ -94,6 +105,7 @@ class ChatSettingsRepository:
             "model": self.default_model,
             "embedding_model": self.default_embedding_model,
             "retrieval_mode": self.default_retrieval_mode,
+            "reranker_mode": self.default_reranker_mode,
             "top_k": 4,
             "memory_mode": "buffer",
             "budget_tokens": 700,
@@ -104,10 +116,13 @@ class ChatSettingsRepository:
         if not isinstance(data, dict) or frozenset(data) not in {
             frozenset(self._fields),
             frozenset(self._fields - {"retrieval_mode"}),
+            frozenset(self._fields - {"reranker_mode"}),
+            frozenset(self._fields - {"retrieval_mode", "reranker_mode"}),
         }:
             raise APIError(400, "Le impostazioni della chat non sono complete.")
         data = dict(data)
         data.setdefault("retrieval_mode", self.default_retrieval_mode)
+        data.setdefault("reranker_mode", self.default_reranker_mode)
         if not isinstance(data["model"], str) or data["model"] not in self.models:
             raise APIError(400, "Modello non supportato.")
         if (
@@ -120,6 +135,16 @@ class ChatSettingsRepository:
             or data["retrieval_mode"] not in self.retrieval_modes
         ):
             raise APIError(400, "Modalità di ricerca non supportata.")
+        if (
+            not isinstance(data["reranker_mode"], str)
+            or data["reranker_mode"] not in self.reranker_modes
+        ):
+            raise APIError(400, "Reranker non supportato.")
+        if data["reranker_mode"] == "cohere" and not self.cohere_configured:
+            raise APIError(
+                400,
+                "Cohere non è configurato: aggiungi COHERE_API_KEY al file .env e riavvia l'app.",
+            )
         if type(data["top_k"]) is not int or not 1 <= data["top_k"] <= 8:
             raise APIError(400, "Il numero di fonti deve essere compreso tra 1 e 8.")
         if not isinstance(data["memory_mode"], str) or data["memory_mode"] not in {
@@ -138,6 +163,7 @@ class ChatSettingsRepository:
             "model": data["model"],
             "embedding_model": data["embedding_model"],
             "retrieval_mode": data["retrieval_mode"],
+            "reranker_mode": data["reranker_mode"],
             "top_k": data["top_k"],
             "memory_mode": data["memory_mode"],
             "budget_tokens": data["budget_tokens"],

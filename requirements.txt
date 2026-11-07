@@ -4,3 +4,4 @@ chromadb
 pypdf
 tiktoken
 rank-bm25
+cohere

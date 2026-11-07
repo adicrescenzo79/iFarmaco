@@ -7,7 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from backend.chat_service import INSTRUCTIONS, ChatService
+from backend.chat_service import ChatUnavailableError, INSTRUCTIONS, ChatService
 from backend.database import Database
 from backend.leaflets import LeafletStore
 from backend.repositories import MedicineRepository, StockRepository
@@ -195,6 +195,135 @@ class ChatServiceTests(unittest.TestCase):
 
         self.assertEqual(result["answer"], "Risposta documentata.")
         self.assertEqual(retrieve.call_args.kwargs["search_mode"], "hybrid")
+
+    def test_cohere_reranker_orders_chunks_and_preserves_source_metadata(self) -> None:
+        chunks = [
+            {
+                "id": "Farmaco A",
+                "medicine_id": "00011",
+                "page": 1,
+                "text": "Testo generico.",
+                "score": 0.02,
+            },
+            {
+                "id": "Farmaco B",
+                "medicine_id": "00012",
+                "page": 4,
+                "text": "Passaggio che risponde alla domanda.",
+                "score": 0.03,
+            },
+        ]
+        cohere_client = Mock()
+        cohere_client.rerank.return_value.results = [
+            SimpleNamespace(index=1, relevance_score=0.98),
+            SimpleNamespace(index=0, relevance_score=0.12),
+        ]
+        cohere_module = SimpleNamespace(
+            ClientV2=Mock(return_value=cohere_client)
+        )
+
+        with (
+            patch.dict(os.environ, {"COHERE_API_KEY": "test-key"}),
+            patch.dict("sys.modules", {"cohere": cohere_module}),
+        ):
+            ranked = self.service._rerank_with_cohere(
+                "Quale passaggio risponde?", chunks, 2
+            )
+
+        self.assertEqual([chunk["medicine_id"] for chunk in ranked], ["00012", "00011"])
+        self.assertEqual([chunk["page"] for chunk in ranked], [4, 1])
+        self.assertEqual([chunk["score"] for chunk in ranked], [0.98, 0.12])
+        cohere_client.rerank.assert_called_once_with(
+            model="rerank-v3.5",
+            query="Quale passaggio risponde?",
+            documents=[chunk["text"] for chunk in chunks],
+            top_n=2,
+        )
+
+    def test_cohere_reranker_requires_key_without_breaking_default_chat(self) -> None:
+        chunk = {
+            "id": "Farmaco di prova",
+            "medicine_id": "00011",
+            "page": 1,
+            "score": 0.9,
+            "text": "Testo del bugiardino.",
+        }
+        with (
+            patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}, clear=True),
+            patch.object(self.service, "_openai_client", return_value=Mock()),
+            patch.object(self.service, "_retrieve_all", return_value=[chunk]),
+            patch.object(
+                self.service,
+                "_condense",
+                side_effect=lambda _, __, ___, query, ____: query,
+            ),
+            patch.object(
+                self.service, "_generate", return_value="Risposta documentata."
+            ),
+            patch.object(ChatService, "_count_tokens", return_value=10),
+        ):
+            with self.assertRaises(ChatUnavailableError):
+                self.service.respond(
+                    {
+                        "session_id": "no-cohere-key",
+                        "message": "Informazioni sul farmaco",
+                        "reranker_mode": "cohere",
+                    }
+                )
+            result = self.service.respond(
+                {
+                    "session_id": "default-without-cohere",
+                    "message": "Informazioni sul farmaco",
+                }
+            )
+
+        self.assertEqual(result["answer"], "Risposta documentata.")
+
+    def test_chat_uses_selected_cohere_reranker_on_candidate_pool(self) -> None:
+        chunk = {
+            "id": "Farmaco di prova",
+            "medicine_id": "00011",
+            "page": 1,
+            "score": 0.9,
+            "text": "Testo del bugiardino.",
+        }
+        client = Mock()
+        with (
+            patch.dict(
+                os.environ,
+                {"OPENAI_API_KEY": "test-key", "COHERE_API_KEY": "test-key"},
+            ),
+            patch.object(self.service, "_openai_client", return_value=client),
+            patch.object(
+                self.service, "_retrieve_all", return_value=[chunk]
+            ) as retrieve,
+            patch.object(
+                self.service,
+                "_condense",
+                side_effect=lambda _, __, ___, query, ____: query,
+            ),
+            patch.object(
+                self.service, "_rerank_with_cohere", return_value=[chunk]
+            ) as rerank,
+            patch.object(
+                self.service, "_generate", return_value="Risposta documentata."
+            ),
+            patch.object(ChatService, "_count_tokens", return_value=10),
+        ):
+            result = self.service.respond(
+                {
+                    "session_id": "cohere-session",
+                    "message": "Informazioni sul farmaco",
+                    "reranker_mode": "cohere",
+                    "top_k": 3,
+                }
+            )
+
+        self.assertEqual(result["answer"], "Risposta documentata.")
+        self.assertEqual(retrieve.call_args.args[2], 15)
+        rerank.assert_called_once_with(
+            "Informazioni sul farmaco", [chunk], 3
+        )
 
     def test_diversified_retrieval_scans_all_chunks_and_excludes_prior_medicines(
         self,
@@ -768,6 +897,9 @@ class ChatServiceTests(unittest.TestCase):
         self.assertTrue(
             ChatService._is_inventory_question("Quali farmaci sono scaduti?")
         )
+        self.assertTrue(
+            ChatService._is_inventory_question("Quando scade Ximocillina?")
+        )
         self.assertFalse(
             ChatService._is_inventory_question(
                 "Quante volte al giorno devo assumere Ximocillina?"
@@ -779,6 +911,41 @@ class ChatServiceTests(unittest.TestCase):
                 "Ho un farmaco a base di paracetamolo?"
             )
         )
+
+    def test_expiry_date_question_uses_stock_database_not_leaflet_history(self) -> None:
+        self.service._save_session(
+            self.service._session_path("expiry-date-follow-up"),
+            [
+                {"role": "user", "content": "Mi fanno male i muscoli."},
+                {
+                    "role": "assistant",
+                    "content": "Il foglietto di AMOXICILLINA E ACIDO CLAVULANICO ABC parla di dolori muscolari.",
+                    "sources": [
+                        {"medicine_id": "00013", "id": "AMOXICILLINA E ACIDO CLAVULANICO ABC", "page": 2}
+                    ],
+                },
+            ],
+            ["00013"],
+        )
+
+        with (
+            patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}),
+            patch.object(self.service, "_openai_client") as openai_client,
+            patch.object(self.service, "_retrieve_all") as retrieve_all,
+        ):
+            result = self.service.respond(
+                {
+                    "session_id": "expiry-date-follow-up",
+                    "message": "Quando scade AMOXICILLINA E ACIDO CLAVULANICO ABC?",
+                }
+            )
+
+        self.assertIn("31/01/2027", result["answer"])
+        self.assertIn("31/01/2025", result["answer"])
+        self.assertEqual(result["sources"], [])
+        self.assertEqual(result["medicine_ids"], ["00013"])
+        openai_client.assert_not_called()
+        retrieve_all.assert_not_called()
 
     def test_expired_stock_question_lists_all_medicines_without_selection(self) -> None:
         with (
